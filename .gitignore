@@ -29,3 +29,10 @@ dist/
 # --- Machine-learning GME estimation: separate repository (gme_qml), not part of this package ---
 gme_qml/
 src/hubbard_gme/data_for_ML/
+
+# --- Run logs, sync logs, editor backups, Dropbox metadata ---
+/*.log
+/rsync_*.txt
+*~
+*.bak
+*com.dropbox.attrs

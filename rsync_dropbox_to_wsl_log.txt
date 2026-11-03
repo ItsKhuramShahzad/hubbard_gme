@@ -1,8 +1,0 @@
-sending incremental file list
-hubbard_gme/replot_tscan.py
-          2.90K 100%    0.00kB/s    0:00:00            2.90K 100%    0.00kB/s    0:00:00 (xfr#1, ir-chk=1309/5299)
-hubbard_gme/src/hubbard_gme/thermal_pipeline.py
-         32.77K  25%    0.00kB/s    0:00:00          128.26K 100%   91.07MB/s    0:00:00 (xfr#2, ir-chk=3176/32802)
-
-sent 1.12M bytes  received 558 bytes  57.57K bytes/sec
-total size is 212.88G  speedup is 189,627.01
