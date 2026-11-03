@@ -25,3 +25,7 @@ dist/
 
 # --- Jupyter checkpoints ---
 .ipynb_checkpoints/
+
+# --- Machine-learning GME estimation: separate repository (gme_qml), not part of this package ---
+gme_qml/
+src/hubbard_gme/data_for_ML/
