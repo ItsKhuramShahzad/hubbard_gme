@@ -1,4 +1,4 @@
-# hubbard_gme
+# Genuine multipartite entanglement in ring-shaped Hubbard models
 
 **Genuine multipartite entanglement (GME) of interacting electrons, from exact many-body states to
 convex-roof measures, for the Hubbard model and molecular active spaces.**
@@ -189,7 +189,8 @@ hubbard_gme/
 └── enviornment_qchem.yml, requirements.txt, setup.py
 ```
 
-Large caches (`results/`, `outputs/`) are kept out of Git except for PDF reports.
+Large caches (`results/`, `outputs/`) are kept out of Git except for PDF reports and the PKLs
+behind the paper figures and tables (`results/rdm_pkl_results/thermal_runs/`, listed in `.gitignore`).
 
 ---
 
