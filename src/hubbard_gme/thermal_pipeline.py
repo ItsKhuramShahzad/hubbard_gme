@@ -69,6 +69,7 @@ from .rdm import (
 from .gme import supervisor_gme_lower_bound, compute_C_GME_pure
 from .convex_roof import convex_roof_gcg
 from .metrics import compute_purity, compute_entropy
+from . import rdm_sym as _rs
 
 
 # ── Color palette for n=2..6 ─────────────────────────────────────────────────
@@ -165,6 +166,12 @@ def _sector_label(spin_preserving: bool) -> str:
 def _proj_tag(project_doublons: bool) -> str:
     """Filename tag of a projected run; empty otherwise, so existing names stay valid."""
     return "_proj1" if project_doublons else ""
+
+
+def _sym_tag(sym_rdm: bool) -> str:
+    """Filename tag of an RDM bank built with --sym-rdm (degenerate levels stored as their average);
+    empty otherwise, so existing names stay valid."""
+    return "_sym1" if sym_rdm else ""
 
 
 def _thermal_cache_path(
@@ -347,6 +354,7 @@ def _rdm_bank_cache_path(
     n_max: Optional[int] = None,
     V: float = 0.0,
     project_doublons: bool = False,
+    sym_rdm: bool = False,
 ) -> Path:
     """
     Deterministic path for the generic RDM bank (energies + averaged Γ^(n)).
@@ -367,7 +375,8 @@ def _rdm_bank_cache_path(
         f"mode-{mode}_tp{_optional_float_tag(t_prime)}_"
         f"t2{_optional_float_tag(t2)}_tperp{_optional_float_tag(t_perp)}{v_tag}_"
         f"nmin{n_min}{nmax_tag}_{_sector_tag(spin_preserving)}_"
-        f"clusteravg{int(bool(average_site_clusters))}{_proj_tag(project_doublons)}.pkl"
+        f"clusteravg{int(bool(average_site_clusters))}{_proj_tag(project_doublons)}"
+        f"{_sym_tag(sym_rdm)}.pkl"
     )
     return _rdm_bank_dir() / filename
 
@@ -448,14 +457,167 @@ class _OperatorTable(dict):
     Operator table {(bra_idx, ket_idx): sparse_matrix} of one site cluster.
 
     mask is the doublon mask of the cluster, or None for the ordinary nBRDM.
+    sym is a _SymInfo when the table was built with sym_rdm=True (only the independent
+    elements are built; the rest are built on demand), or None for the full table.
     """
 
     mask: Optional[np.ndarray] = None
+    sym: Optional["_SymInfo"] = None
+
+
+def _cluster_operator(sites: tuple, bra: int, ket: int, n_so: int, n_electrons: int,
+                      spin_preserving: bool = True):
+    """O_{bra,ket} = prod_k c^dag_{2 s_k + bra_k} c_{2 s_k + ket_k} as a sparse matrix (bit k = 1: down)."""
+    op_terms = []
+    for body, site in enumerate(sites):
+        p = 2 * site + ((bra >> body) & 1)
+        q = 2 * site + ((ket >> body) & 1)
+        op_terms += [(p, 1), (q, 0)]
+    return get_number_preserving_sparse_operator(
+        FermionOperator(tuple(op_terms)), n_so, n_electrons, spin_preserving=spin_preserving
+    )
+
+
+# ── --sym-rdm: the nBRDM from its independent elements ───────────────────────
+#
+# Three exact properties (docs/sz_block_rdm.tex, rdm_sym.py) of Gamma[a,b] = Tr(rho O_ab):
+#   1. S_z blocks:   Gamma[a,b] = 0 unless a and b have the same number of down spins,
+#                    if rho commutes with the total S_z;
+#   2. hermiticity:  Gamma[b,a] = conj(Gamma[a,b]), always;
+#   3. spin flip:    Gamma[abar,bbar] = Gamma[a,b], if F rho F^dag = rho, F = exchange of up and down on
+#                    every site.
+# rho is (1/K) sum_k |v_k><v_k| over a SET of vectors: one eigenvector, a degenerate level, or one level of
+# the thermal sum (equal Boltzmann weights inside a level). The conditions are checked exactly on that set,
+# not on single vectors: P_s V and F V must lie in span(V) for every total-S_z sector s (sufficient for
+# [rho, S_z] = 0 and F rho F^dag = rho when the K vectors carry equal weights). A single vector of a
+# degenerate level can fail the check while the whole level passes. When a check fails, the corresponding
+# elements are computed, never assumed. The doublon mask D (--project-doublons) commutes with S_z and F, so
+# the checks are made on the unmasked vectors and the elements are evaluated on the masked ones.
+
+_SYM_CHECK_TOL = 1e-9          # relative residual ||X - V V^+ X|| / ||V|| allowed in the checks
+
+
+class _SymInfo:
+    """Bookkeeping of a --sym-rdm operator table: the cluster, the basis data and counters."""
+
+    def __init__(self, sites: tuple, n_so: int, n_electrons: int, spin_preserving: bool):
+        self.sites = tuple(int(s) for s in sites)
+        self.n = len(self.sites)
+        self.n_so = int(n_so)
+        self.n_electrons = int(n_electrons)
+        self.spin_preserving = bool(spin_preserving)
+        self.sz2, self.flip_perm, self.flip_sign = _sym_basis(self.n_so, self.n_electrons,
+                                                              self.spin_preserving)
+        self.n_built = 0                   # operators built for this table
+        self.calls: list = []              # (K, use_sz, use_flip) of every evaluation, for checks
+
+
+_SYM_BASIS_CACHE: dict = {}
+
+
+def _sym_basis(n_so: int, n_electrons: int, spin_preserving: bool):
+    """
+    Per basis configuration c (state-vector order): sz2[c] = 2 S_z(c), and the spin flip
+    F|c> = flip_sign[c] |flip_perm[c]>, or flip_perm = None if the flipped configurations are not all in
+    the basis (e.g. a sector with S_z != 0).
+
+    F c^dag_{j,s} F^dag = c^dag_{j,-s} with F|vac> = |vac>. Exchanging the two spin-orbitals of a site keeps
+    the order of the creation operators of the other sites; only a doubly occupied site reorders its pair,
+    so the sign is (-1)^(number of doublons). The basis order of OpenFermion is checked against the number
+    operators of every spin-orbital before it is used (cached per Hilbert space).
+    """
+    key = (int(n_so), int(n_electrons), bool(spin_preserving))
+    if key in _SYM_BASIS_CACHE:
+        return _SYM_BASIS_CACHE[key]
+    occ = _basis_occupations(n_so, n_electrons, spin_preserving)
+    for orbital in range(n_so):
+        number = get_number_preserving_sparse_operator(
+            FermionOperator(((orbital, 1), (orbital, 0))), n_so, n_electrons,
+            spin_preserving=spin_preserving,
+        )
+        if not np.array_equal(number.diagonal().real > 0.5, occ[:, orbital]):
+            raise RuntimeError(f"Basis order mismatch for spin-orbital {orbital} (--sym-rdm).")
+    up, down = occ[:, 0::2], occ[:, 1::2]
+    sz2 = up.sum(axis=1).astype(int) - down.sum(axis=1).astype(int)
+    weights = (1 << np.arange(n_so, dtype=np.int64))
+    code = occ.astype(np.int64) @ weights
+    flipped = np.empty_like(occ)
+    flipped[:, 0::2], flipped[:, 1::2] = down, up
+    code_flipped = flipped.astype(np.int64) @ weights
+    order = np.argsort(code)
+    pos = np.searchsorted(code[order], code_flipped)
+    pos = np.clip(pos, 0, len(code) - 1)
+    found = code[order][pos] == code_flipped
+    if found.all():
+        flip_perm = order[pos]
+        flip_sign = np.where((up & down).sum(axis=1) % 2 == 1, -1.0, 1.0)
+    else:
+        flip_perm, flip_sign = None, None
+    _SYM_BASIS_CACHE[key] = (sz2, flip_perm, flip_sign)
+    return _SYM_BASIS_CACHE[key]
+
+
+def _apply_flip(info: _SymInfo, V: np.ndarray) -> np.ndarray:
+    """F V for state vectors in the columns of V (requires info.flip_perm)."""
+    FV = np.empty_like(V)
+    FV[info.flip_perm] = info.flip_sign[:, None] * V
+    return FV
+
+
+def _outside_span(V: np.ndarray, X: np.ndarray) -> float:
+    """||X - P_V X||_F, P_V the orthogonal projector on span(V) (V: n_conf x K, full column rank)."""
+    coef, *_ = np.linalg.lstsq(V, X, rcond=None)
+    return float(np.linalg.norm(X - V @ coef))
+
+
+def _sym_checks(info: _SymInfo, V: np.ndarray) -> tuple[bool, bool]:
+    """(use_sz, use_flip) for the equal-weight set of vectors V (columns), from exact span checks."""
+    scale = float(np.linalg.norm(V))
+    if scale == 0.0:
+        return info.spin_preserving, False
+    if info.spin_preserving:
+        use_sz = True                      # one S_z sector: rho commutes with S_z by construction
+    else:
+        res2 = 0.0
+        for s in np.unique(info.sz2):
+            P_sV = np.where((info.sz2 == s)[:, None], V, 0.0)
+            res2 += _outside_span(V, P_sV) ** 2
+        use_sz = np.sqrt(res2) <= _SYM_CHECK_TOL * scale
+    use_flip = (use_sz and info.flip_perm is not None
+                and _outside_span(V, _apply_flip(info, V)) <= _SYM_CHECK_TOL * scale)
+    return bool(use_sz), bool(use_flip)
+
+
+def _sym_rdm_sum(ops: _OperatorTable, V: np.ndarray, n: int) -> np.ndarray:
+    """
+    sum_k Gamma^(n)[v_k] for the vectors in the columns of V (unnormalised; one vector: the RDM of that
+    vector). The vectors must carry equal weight in the state used (one vector, a degenerate level, or one
+    level of a thermal sum). Only the independent elements allowed by the exact checks are evaluated; the
+    rest are filled by hermiticity and the spin flip (rdm_sym.fill_from_independent).
+    """
+    info = ops.sym
+    V = np.asarray(V)
+    if V.ndim == 1:
+        V = V[:, None]
+    use_sz, use_flip = _sym_checks(info, V)
+    W = V * ops.mask[:, None] if ops.mask is not None else V
+    values = {}
+    for pair in _rs.independent_pairs(n, use_sz=use_sz, use_spin_flip=use_flip):
+        op = ops.get(pair)
+        if op is None:                     # not in the table yet: a check failed for this set
+            op = _cluster_operator(info.sites, pair[0], pair[1], info.n_so, info.n_electrons,
+                                   info.spin_preserving)
+            ops[pair] = op
+            info.n_built += 1
+        values[pair] = complex(np.sum(np.conj(W) * (op @ W)))
+    info.calls.append((V.shape[1], use_sz, use_flip))
+    return _rs.fill_from_independent(values, n, use_sz=use_sz, use_spin_flip=use_flip)
 
 
 def _precompute_ops(sites: tuple, n_so: int, n_electrons: int,
                     spin_preserving: bool = True,
-                    project_doublons: bool = False) -> dict:
+                    project_doublons: bool = False,
+                    sym_rdm: bool = False) -> dict:
     """
     Build the (2^n)^2 sparse operator table for compute_general_nRDM
     for a fixed site cluster.  Operators depend only on sites, not on
@@ -464,6 +626,10 @@ def _precompute_ops(sites: tuple, n_so: int, n_electrons: int,
     project_doublons=True leaves the operators unchanged and stores the doublon
     mask of the cluster in the table; _rdm_from_ops then uses the masked state.
 
+    sym_rdm=True builds only the independent elements of the S_z blocks with the spin flip
+    (rdm_sym.independent_pairs); _rdm_from_ops / _sym_rdm_sum check the symmetries on the state
+    and build any further operator they need on demand.
+
     Returns _OperatorTable {(bra_idx, ket_idx): sparse_matrix}.
     """
     n = len(sites)
@@ -471,6 +637,12 @@ def _precompute_ops(sites: tuple, n_so: int, n_electrons: int,
     ops = _OperatorTable()
     if project_doublons:
         ops.mask = _cluster_doublon_mask(sites, n_so, n_electrons, spin_preserving)
+    if sym_rdm:
+        ops.sym = _SymInfo(sites, n_so, n_electrons, spin_preserving)
+        for bra, ket in _rs.independent_pairs(n, use_sz=True, use_spin_flip=True):
+            ops[(bra, ket)] = _cluster_operator(sites, bra, ket, n_so, n_electrons, spin_preserving)
+            ops.sym.n_built += 1
+        return ops
     for bra in range(dim):
         bra_spins = [(bra >> k) & 1 for k in range(n)]
         for ket in range(dim):
@@ -494,7 +666,10 @@ def _rdm_from_ops(ops: _OperatorTable, psi: np.ndarray, n: int) -> np.ndarray:
 
     If the table holds a doublon mask, ψ is first replaced by ψ_P: a copy with the
     configurations with a doublon on the cluster set to zero, not renormalised.
+    A --sym-rdm table evaluates only the independent elements (_sym_rdm_sum).
     """
+    if ops.sym is not None:
+        return _sym_rdm_sum(ops, psi, n)
     if ops.mask is not None:
         psi = psi * ops.mask
     dim = 2 ** n
@@ -504,11 +679,41 @@ def _rdm_from_ops(ops: _OperatorTable, psi: np.ndarray, n: int) -> np.ndarray:
     return rho
 
 
+def _level_rdm_average(ops: _OperatorTable, vectors: np.ndarray, n: int) -> np.ndarray:
+    """(1/K) sum_k Gamma^(n)[v_k] over a degenerate level (columns of vectors)."""
+    if ops.sym is not None:
+        return _sym_rdm_sum(ops, vectors, n) / vectors.shape[1]
+    dim = 2 ** n
+    rho = np.zeros((dim, dim), dtype=complex)
+    for k in range(vectors.shape[1]):
+        rho += _rdm_from_ops(ops, vectors[:, k], n)
+    return rho / vectors.shape[1]
+
+
+def _degenerate_levels(energies: np.ndarray, tol: float = 1e-10) -> list[np.ndarray]:
+    """
+    Indices of the eigenstates grouped in degenerate levels: a level starts at its lowest energy E_a and
+    holds every state with E - E_a < tol (the rule used for the T = 0 manifold, |E - E0| < 1e-10).
+    """
+    energies = np.asarray(energies, dtype=float)
+    order = np.argsort(energies, kind="stable")
+    levels, start = [], 0
+    while start < len(order):
+        stop = start + 1
+        while stop < len(order) and energies[order[stop]] - energies[order[start]] < tol:
+            stop += 1
+        levels.append(np.sort(order[start:stop]))
+        start = stop
+    return levels
+
+
 _THERMAL_WORKER_EIGVECS: Optional[np.ndarray] = None
 _THERMAL_WORKER_N_SO: Optional[int] = None
 _THERMAL_WORKER_N_ELECTRONS: Optional[int] = None
 _THERMAL_WORKER_SPIN_PRESERVING: bool = True
 _THERMAL_WORKER_PROJECT_DOUBLONS: bool = False
+_THERMAL_WORKER_SYM_RDM: bool = False
+_THERMAL_WORKER_ENERGIES: Optional[np.ndarray] = None
 
 
 def _init_thermal_rdm_worker(
@@ -517,6 +722,8 @@ def _init_thermal_rdm_worker(
     n_electrons: int,
     spin_preserving: bool = True,
     project_doublons: bool = False,
+    sym_rdm: bool = False,
+    energies: Optional[np.ndarray] = None,
 ) -> None:
     """Initialise multiprocessing worker state for RDM-bank jobs."""
     global _THERMAL_WORKER_EIGVECS
@@ -524,17 +731,23 @@ def _init_thermal_rdm_worker(
     global _THERMAL_WORKER_N_ELECTRONS
     global _THERMAL_WORKER_SPIN_PRESERVING
     global _THERMAL_WORKER_PROJECT_DOUBLONS
+    global _THERMAL_WORKER_SYM_RDM
+    global _THERMAL_WORKER_ENERGIES
     _THERMAL_WORKER_EIGVECS = eigvecs
     _THERMAL_WORKER_N_SO = int(n_so)
     _THERMAL_WORKER_N_ELECTRONS = int(n_electrons)
     _THERMAL_WORKER_SPIN_PRESERVING = bool(spin_preserving)
     _THERMAL_WORKER_PROJECT_DOUBLONS = bool(project_doublons)
+    _THERMAL_WORKER_SYM_RDM = bool(sym_rdm)
+    _THERMAL_WORKER_ENERGIES = None if energies is None else np.asarray(energies)
 
 
 def _reset_thermal_rdm_worker() -> None:
     """Drop the parent's module-level reference to the shared eigenvectors."""
     global _THERMAL_WORKER_EIGVECS
+    global _THERMAL_WORKER_ENERGIES
     _THERMAL_WORKER_EIGVECS = None
+    _THERMAL_WORKER_ENERGIES = None
 
 
 def _compute_cluster_rdm_bank(
@@ -545,16 +758,31 @@ def _compute_cluster_rdm_bank(
     n_electrons: int,
     spin_preserving: bool = True,
     project_doublons: bool = False,
+    sym_rdm: bool = False,
+    energies: Optional[np.ndarray] = None,
 ) -> tuple[int, tuple, np.ndarray, float]:
-    """Compute Γ^(n)[ψ_m] for one site cluster and all eigenstates."""
+    """
+    Compute Γ^(n)[ψ_m] for one site cluster and all eigenstates.
+
+    sym_rdm=True (needs energies): each degenerate level (_degenerate_levels) is evaluated as a whole with
+    the symmetric construction, and every state of the level stores the level average
+    (1/g) sum_{m in level} Γ^(n)[ψ_m]. Thermal sums are unchanged, since all states of a level carry the
+    same Boltzmann weight; single entries of a degenerate level differ from the flag-off bank.
+    """
     t0 = time.time()
     ops = _precompute_ops(sites, n_so, n_electrons, spin_preserving=spin_preserving,
-                          project_doublons=project_doublons)
+                          project_doublons=project_doublons, sym_rdm=sym_rdm)
     n_states = eigvecs.shape[1]
     dim = 2 ** n
     rdms = np.zeros((n_states, dim, dim), dtype=complex)
-    for m in range(n_states):
-        rdms[m] = _rdm_from_ops(ops, eigvecs[:, m], n)
+    if sym_rdm:
+        if energies is None or len(energies) != n_states:
+            raise ValueError("sym_rdm=True needs the energies of all eigenstates (degenerate levels).")
+        for level in _degenerate_levels(energies):
+            rdms[level] = _level_rdm_average(ops, eigvecs[:, level], n)
+    else:
+        for m in range(n_states):
+            rdms[m] = _rdm_from_ops(ops, eigvecs[:, m], n)
     return n, sites, rdms, float(time.time() - t0)
 
 
@@ -575,6 +803,8 @@ def _thermal_rdm_cluster_worker(args):
         _THERMAL_WORKER_N_ELECTRONS,
         spin_preserving=_THERMAL_WORKER_SPIN_PRESERVING,
         project_doublons=_THERMAL_WORKER_PROJECT_DOUBLONS,
+        sym_rdm=_THERMAL_WORKER_SYM_RDM,
+        energies=_THERMAL_WORKER_ENERGIES,
     )
 
 
@@ -589,9 +819,14 @@ def _build_rdm_bank(
     verbose: bool = True,
     spin_preserving: bool = True,
     project_doublons: bool = False,
+    sym_rdm: bool = False,
+    energies: Optional[np.ndarray] = None,
 ) -> dict[int, np.ndarray]:
     """
     Precompute Γ^(n)[ψ_m] for ALL eigenstates m and ALL body orders n.
+
+    sym_rdm=True builds each RDM from its independent elements, one degenerate level at a time
+    (needs energies); see _compute_cluster_rdm_bank.
 
     By default, averages over all contiguous site clusters for n < L.
     For L=6 this gives 6 independent cluster jobs for each n=2..5.
@@ -646,7 +881,7 @@ def _build_rdm_bank(
         # eigenvectors, the large data buffer is never copied — all workers share
         # a single physical copy. RAM stops growing with --workers.
         _init_thermal_rdm_worker(eigvecs, n_so, n_electrons, spin_preserving,
-                                 project_doublons)
+                                 project_doublons, sym_rdm, energies)
         try:
             ctx = mp.get_context("fork")
         except ValueError:                      # non-fork platform (not Linux)
@@ -672,6 +907,7 @@ def _build_rdm_bank(
                 n, sites, eigvecs, n_so, n_electrons,
                 spin_preserving=spin_preserving,
                 project_doublons=project_doublons,
+                sym_rdm=sym_rdm, energies=energies,
             )
             cluster_results[n].append((sites, rdms))
             if verbose:
@@ -718,6 +954,7 @@ def build_or_load_rdm_bank(
     verbose: bool = True,
     n_max: Optional[int] = None,
     project_doublons: bool = False,
+    sym_rdm: bool = False,
 ) -> dict:
     """
     Build — or load from the generic cache — the RDM bank for one Hamiltonian.
@@ -745,12 +982,14 @@ def build_or_load_rdm_bank(
         cache_version=cache_version, spin_preserving=spin_preserving,
         n_max=n_max,
         project_doublons=project_doublons,
+        sym_rdm=sym_rdm,
     )
 
     if use_pkl_cache and not force_recompute:
         payload = _load_thermal_rdm_bank_pkl(cache_path)
         if (payload is not None
-                and bool(payload.get("project_doublons", False)) == bool(project_doublons)):
+                and bool(payload.get("project_doublons", False)) == bool(project_doublons)
+                and bool(payload.get("sym_rdm", False)) == bool(sym_rdm)):
             if verbose:
                 print(f"    [cache] RDM bank → {cache_path}", flush=True)
             return {
@@ -772,6 +1011,7 @@ def build_or_load_rdm_bank(
         L=L, average_site_clusters=average_site_clusters,
         n_workers=n_workers, verbose=verbose, spin_preserving=spin_preserving,
         project_doublons=project_doublons,
+        sym_rdm=sym_rdm, energies=energies,
     )
 
     if use_pkl_cache and save_pkl:
@@ -789,6 +1029,7 @@ def build_or_load_rdm_bank(
             "spin_preserving": bool(spin_preserving),
             "sector": _sector_label(spin_preserving),
             "project_doublons": bool(project_doublons),
+            "sym_rdm": bool(sym_rdm),
             "energies": energies, "bank": bank,
             "environment": _basic_env_meta(),
         }
@@ -1430,6 +1671,7 @@ def run_thermal_gme_analysis(
     spin_preserving: bool = True,\
         T_view_max: Optional[float] = None,
     project_doublons: bool = False,
+    sym_rdm: bool = False,
 ) -> dict:
     """
     Compute C_GME(n, T) for n = n_min..L as a function of temperature T.
@@ -1500,6 +1742,10 @@ def run_thermal_gme_analysis(
                    remove the configurations with a doublon on the cluster sites
                    from each eigenstate, without renormalising (_proj1 PKLs);
                    result["omega"] is the trace of the thermal nBRDM
+    sym_rdm:
+                   build every nBRDM from its independent elements (S_z blocks,
+                   hermiticity, spin flip), checked exactly on each degenerate
+                   level; same RDMs as the full construction (bank tagged _sym1)
 
     Returns
     -------
@@ -1582,6 +1828,7 @@ def run_thermal_gme_analysis(
     )
     print(f"  thermal energy cutoff: {adaptive_msg}")
     print(f"  doublons on the cluster sites removed: {bool(project_doublons)}")
+    print(f"  symmetric nBRDM (--sym-rdm): {bool(sym_rdm)}")
     print(f"  n = {n_min}..{n_max}   T range [{T_values[0]:.4g}, {T_values[-1]:.4g}]"
           f"  ({len(T_values)} points)")
     print(f"{'-'*64}")
@@ -1598,6 +1845,7 @@ def run_thermal_gme_analysis(
         use_pkl_cache=use_pkl_cache, cache_version=cache_version,
         force_recompute=force_recompute, save_pkl=save_pkl, verbose=verbose,
         project_doublons=project_doublons,
+        sym_rdm=sym_rdm,
     )
     energies = bank_info["energies"]
     bank = bank_info["bank"]
@@ -1812,6 +2060,7 @@ def run_thermal_gme_analysis(
         "purity":                purity_dict,
         "omega":                 omega_dict,
         "project_doublons":      bool(project_doublons),
+        "sym_rdm":               bool(sym_rdm),
         "C_exact_gs":            C_exact_gs,
         "energies":              energies,
         "gap":                   gap,
@@ -1839,6 +2088,7 @@ def run_thermal_gme_analysis(
         metadata = {
             "analysis_type": "thermal",
             "project_doublons": bool(project_doublons),
+            "sym_rdm": bool(sym_rdm),
             "cache_version": cache_version,
             "L": int(L),
             "t": float(t),
@@ -2011,6 +2261,7 @@ def run_excited_singlet_gme(
     spin_preserving: bool = True,
     V: float = 0.0,  # optional nearest-neighbour interaction
     T_view_max: Optional[float] = None,
+    sym_rdm: bool = False,
 ) -> dict:
     """
     GME analysis of the first singlet excited state.
@@ -2134,7 +2385,8 @@ def run_excited_singlet_gme(
         sites = tuple(range(n))
         if n not in ops_cache:
             ops_cache[n] = _precompute_ops(sites, n_so, n_electrons,
-                                         spin_preserving=spin_preserving)
+                                         spin_preserving=spin_preserving,
+                                         sym_rdm=sym_rdm)
         rho_raw = _rdm_from_ops(ops_cache[n], psi_singlet, n)
         tr = np.real(np.trace(rho_raw))
         rho = rho_raw / tr if abs(tr) > 1e-14 else rho_raw
@@ -2170,7 +2422,8 @@ def run_excited_singlet_gme(
         eigvecs_full  = singlet_info["eigvecs"]
 
         bank = _build_rdm_bank(n_values, eigvecs_full, n_so, n_electrons,
-                                verbose=verbose, spin_preserving=spin_preserving)
+                                verbose=verbose, spin_preserving=spin_preserving,
+                                sym_rdm=sym_rdm, energies=energies_full)
 
         C_GME_T: dict[int, np.ndarray] = {n: np.zeros(len(T_values)) for n in n_values}
         purity_T: dict[int, np.ndarray] = {n: np.zeros(len(T_values)) for n in n_values}
@@ -2252,6 +2505,7 @@ def run_excited_singlet_gme(
         T_results["plot_path"] = plot_path_T
 
     result = {
+        "sym_rdm":          bool(sym_rdm),
         "singlet_idx":      singlet_idx,
         "singlet_energy":   E_singlet,
         "n_values":         n_values,
@@ -2273,6 +2527,7 @@ def run_excited_singlet_gme(
     if save_pkl:
         metadata = {
             "analysis_type": "excited_singlet",
+            "sym_rdm": bool(sym_rdm),
             "cache_version": cache_version,
             "L": int(L), "t": float(t), "U": float(U),
             "mode": str(mode), "Ne": int(n_electrons),
@@ -2480,6 +2735,7 @@ def run_t_dependence_gme(
     spin_preserving: bool = True,
     excited_singlet: bool = False,
     singlet_k: int = 12,
+    sym_rdm: bool = False,
 ) -> dict:
     """
     Compute C_GME(n) at T = 0 for each value of t (fixing U).
@@ -2601,7 +2857,8 @@ def run_t_dependence_gme(
         for n in n_values:
             sites = tuple(range(n))
             ops = _precompute_ops(sites, n_so, n_electrons,
-                                  spin_preserving=spin_preserving)
+                                  spin_preserving=spin_preserving,
+                                  sym_rdm=sym_rdm)
 
             if len(degen) <= 1:
                 # <=1: non-degenerate state — use psi0 directly. This also
@@ -2611,11 +2868,15 @@ def run_t_dependence_gme(
                 # dividing a zero matrix by 0 (which produced silent NaNs).
                 rho_raw = _rdm_from_ops(ops, psi0, n)
             else:
-                dim = 2 ** n
-                rho_raw = np.zeros((dim, dim), dtype=complex)
-                for d_idx in degen:
-                    rho_raw += _rdm_from_ops(ops, eigvecs[:, d_idx], n)
-                rho_raw /= len(degen)
+                if ops.sym is not None:
+                    # --sym-rdm: the symmetries are checked on the whole level, not on single vectors
+                    rho_raw = _level_rdm_average(ops, eigvecs[:, degen], n)
+                else:
+                    dim = 2 ** n
+                    rho_raw = np.zeros((dim, dim), dtype=complex)
+                    for d_idx in degen:
+                        rho_raw += _rdm_from_ops(ops, eigvecs[:, d_idx], n)
+                    rho_raw /= len(degen)
 
             tr = np.real(np.trace(rho_raw))
             rho = rho_raw / tr if abs(tr) > 1e-14 else rho_raw
@@ -2671,6 +2932,7 @@ def run_t_dependence_gme(
         # which state each grid point used: ground state, or the first
         # excited singlet (whose index moves through level crossings)
         "excited_singlet": bool(excited_singlet),
+        "sym_rdm":         bool(sym_rdm),
         "singlet_k":       int(singlet_k),
         "singlet_idx":     singlet_idx,
         "singlet_energy":  singlet_energy,
@@ -2685,6 +2947,7 @@ def run_t_dependence_gme(
     if save_pkl or use_pkl_cache:
         metadata = {
             "analysis_type": "t_dependence",
+            "sym_rdm": bool(sym_rdm),
             "cache_version": cache_version,
             "L": int(L), "U": float(U), "V": float(V),
             "mode": str(mode), "Ne": int(n_electrons),
@@ -3101,6 +3364,7 @@ def run_tT_surface_gme(
     V: float = 0.0,
     excited_singlet: bool = False,
     singlet_k: int = 0,
+    sym_rdm: bool = False,
 ) -> dict:
     """
     Compute the 3D thermal-GME surface C_GME(n; t/U, T).
@@ -3293,6 +3557,7 @@ def run_tT_surface_gme(
             use_pkl_cache=use_pkl_cache, cache_version=cache_version,
             force_recompute=force_recompute, save_pkl=save_pkl, verbose=False,
             n_max=n_max,
+            sym_rdm=sym_rdm,
         )
         energies = bank_info["energies"]
         bank = bank_info["bank"]
@@ -3396,6 +3661,7 @@ def run_tT_surface_gme(
         "n_values":        n_values,
         "solver":          solver,
         "spin_preserving": bool(spin_preserving),
+        "sym_rdm":         bool(sym_rdm),
         "system_info":     dict(L=L, U=U,V=V, mode=mode, Ne=n_electrons),
         "run_timestamp":   ts,
         "loaded_from_cache": False,
@@ -3408,6 +3674,7 @@ def run_tT_surface_gme(
     if save_pkl or use_pkl_cache:
         metadata = {
             "analysis_type": "tT_surface",
+            "sym_rdm": bool(sym_rdm),
             "cache_version": cache_version,
             "L": int(L), "U": float(U), "V": float(V),
             "mode": str(mode), "Ne": int(n_electrons),
@@ -3567,6 +3834,7 @@ def run_U_dependence_gme(
     excited_singlet: bool = False,
     singlet_k: int = 12,
     project_doublons: bool = False,
+    sym_rdm: bool = False,
 ) -> dict:
     """
     Compute C_GME(n) at T=0 for each value of U (fixing t).
@@ -3690,7 +3958,8 @@ def run_U_dependence_gme(
             sites = tuple(range(n))
             ops = _precompute_ops(sites, n_so, n_electrons,
                                   spin_preserving=spin_preserving,
-                                  project_doublons=project_doublons)
+                                  project_doublons=project_doublons,
+                                  sym_rdm=sym_rdm)
 
             if len(degen) <= 1:
                 # <=1: non-degenerate state — use psi0 directly. This also
@@ -3700,11 +3969,15 @@ def run_U_dependence_gme(
                 # dividing a zero matrix by 0 (which produced silent NaNs).
                 rho_raw = _rdm_from_ops(ops, psi0, n)
             else:
-                dim = 2 ** n
-                rho_raw = np.zeros((dim, dim), dtype=complex)
-                for d_idx in degen:
-                    rho_raw += _rdm_from_ops(ops, eigvecs[:, d_idx], n)
-                rho_raw /= len(degen)
+                if ops.sym is not None:
+                    # --sym-rdm: the symmetries are checked on the whole level, not on single vectors
+                    rho_raw = _level_rdm_average(ops, eigvecs[:, degen], n)
+                else:
+                    dim = 2 ** n
+                    rho_raw = np.zeros((dim, dim), dtype=complex)
+                    for d_idx in degen:
+                        rho_raw += _rdm_from_ops(ops, eigvecs[:, d_idx], n)
+                    rho_raw /= len(degen)
 
             tr = np.real(np.trace(rho_raw))
             rho = rho_raw / tr if abs(tr) > 1e-14 else rho_raw
@@ -3753,6 +4026,7 @@ def run_U_dependence_gme(
         "purity":        purity_dict,
         "omega":         omega_dict,
         "project_doublons": bool(project_doublons),
+        "sym_rdm": bool(sym_rdm),
         "entropy":       entropy_dict,
         "rank":          rank_dict,
         "convergence":   convergence,   # {n: [solver detail per U]} — standard compute_gme format
@@ -3777,6 +4051,7 @@ def run_U_dependence_gme(
         metadata = {
             "analysis_type": "U_dependence",
             "project_doublons": bool(project_doublons),
+            "sym_rdm": bool(sym_rdm),
             "cache_version": cache_version,
             "L": int(L), "t": float(t), "V": float(V),
             "mode": str(mode), "Ne": int(n_electrons),
@@ -3824,6 +4099,7 @@ def run_V_dependence_gme(
     excited_singlet: bool = False,
     singlet_k: int = 12,
     project_doublons: bool = False,
+    sym_rdm: bool = False,
 ) -> dict:
     """
     Compute C_GME(n) at T=0 for each value of the nearest-neighbour interaction
@@ -3936,7 +4212,8 @@ def run_V_dependence_gme(
             sites = tuple(range(n))
             ops = _precompute_ops(sites, n_so, n_electrons,
                                   spin_preserving=spin_preserving,
-                                  project_doublons=project_doublons)
+                                  project_doublons=project_doublons,
+                                  sym_rdm=sym_rdm)
 
             if len(degen) <= 1:
                 # <=1: non-degenerate state — use psi0 directly. This also
@@ -3946,11 +4223,15 @@ def run_V_dependence_gme(
                 # dividing a zero matrix by 0 (which produced silent NaNs).
                 rho_raw = _rdm_from_ops(ops, psi0, n)
             else:
-                dim = 2 ** n
-                rho_raw = np.zeros((dim, dim), dtype=complex)
-                for d_idx in degen:
-                    rho_raw += _rdm_from_ops(ops, eigvecs[:, d_idx], n)
-                rho_raw /= len(degen)
+                if ops.sym is not None:
+                    # --sym-rdm: the symmetries are checked on the whole level, not on single vectors
+                    rho_raw = _level_rdm_average(ops, eigvecs[:, degen], n)
+                else:
+                    dim = 2 ** n
+                    rho_raw = np.zeros((dim, dim), dtype=complex)
+                    for d_idx in degen:
+                        rho_raw += _rdm_from_ops(ops, eigvecs[:, d_idx], n)
+                    rho_raw /= len(degen)
 
             tr = np.real(np.trace(rho_raw))
             rho = rho_raw / tr if abs(tr) > 1e-14 else rho_raw
@@ -3998,6 +4279,7 @@ def run_V_dependence_gme(
         "purity":        purity_dict,
         "omega":         omega_dict,
         "project_doublons": bool(project_doublons),
+        "sym_rdm": bool(sym_rdm),
         "entropy":       entropy_dict,
         "rank":          rank_dict,
         "convergence":   convergence,
@@ -4019,6 +4301,7 @@ def run_V_dependence_gme(
         metadata = {
             "analysis_type": "V_dependence",
             "project_doublons": bool(project_doublons),
+            "sym_rdm": bool(sym_rdm),
             "cache_version": cache_version,
             "L": int(L), "t": float(t), "U": float(U),
             "mode": str(mode), "Ne": int(n_electrons),
@@ -4106,6 +4389,7 @@ def run_Ne_dependence_gme(
     excited_singlet: bool = False,
     singlet_k: int = 16,
     project_doublons: bool = False,
+    sym_rdm: bool = False,
 ) -> dict:
     """
     C_GME(n) at T=0 as a function of the electron number Ne (the N-scan),
@@ -4223,16 +4507,21 @@ def run_Ne_dependence_gme(
             sites = tuple(range(n))
             ops = _precompute_ops(sites, n_so, Ne,
                                   spin_preserving=spin_preserving,
-                                  project_doublons=project_doublons)
+                                  project_doublons=project_doublons,
+                                  sym_rdm=sym_rdm)
 
             if len(degen) <= 1:
                 rho_raw = _rdm_from_ops(ops, psi0, n)
             else:
-                dim = 2 ** n
-                rho_raw = np.zeros((dim, dim), dtype=complex)
-                for d_idx in degen:
-                    rho_raw += _rdm_from_ops(ops, eigvecs[:, d_idx], n)
-                rho_raw /= len(degen)
+                if ops.sym is not None:
+                    # --sym-rdm: the symmetries are checked on the whole level, not on single vectors
+                    rho_raw = _level_rdm_average(ops, eigvecs[:, degen], n)
+                else:
+                    dim = 2 ** n
+                    rho_raw = np.zeros((dim, dim), dtype=complex)
+                    for d_idx in degen:
+                        rho_raw += _rdm_from_ops(ops, eigvecs[:, d_idx], n)
+                    rho_raw /= len(degen)
 
             tr = np.real(np.trace(rho_raw))
             rho = rho_raw / tr if abs(tr) > 1e-14 else rho_raw
@@ -4276,6 +4565,7 @@ def run_Ne_dependence_gme(
         "purity":        purity_dict,
         "omega":         omega_dict,
         "project_doublons": bool(project_doublons),
+        "sym_rdm": bool(sym_rdm),
         "entropy":       entropy_dict,
         "rank":          rank_dict,
         "convergence":   convergence,
@@ -4297,6 +4587,7 @@ def run_Ne_dependence_gme(
         metadata = {
             "analysis_type": "N_dependence",
             "project_doublons": bool(project_doublons),
+            "sym_rdm": bool(sym_rdm),
             "cache_version": cache_version,
             "L": int(L), "t": float(t), "U": float(U), "V": float(V),
             "mode": str(mode),

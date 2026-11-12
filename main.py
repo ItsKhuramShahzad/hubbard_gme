@@ -450,6 +450,13 @@ def build_parser() -> argparse.ArgumentParser:
                                 "sites of each cluster before building the nBRDM, "
                                 "without renormalising (PKLs tagged _proj1). "
                                 "Only with --thermal, --u-scan, --v-scan or --n-scan.")
+    therm_grp.add_argument("--sym-rdm", action="store_true", dest="sym_rdm",
+                           help="Build every nBRDM from its independent elements only: S_z blocks, "
+                                "hermiticity and the spin flip, each checked exactly on the state "
+                                "(on the whole level for degenerate levels and thermal sums) and "
+                                "computed instead when a check fails. Same RDMs as without the flag; "
+                                "RDM banks tagged _sym1. With --thermal, --excited-singlet, --t-scan, "
+                                "--tT-surface, --u-scan, --v-scan, --n-scan or --build-bank.")
     therm_grp.add_argument("--T-view-max", type=float, default=None, dest="T_view_max",
                        help="Cap the thermal-plot x-axis at this T (view only; "
                             "does not change the data). Default: auto-clip.")
@@ -555,6 +562,13 @@ def main():
         if sum(map(bool, routes)) != 1 or any(others):
             parser.error("--project-doublons works only with exactly one of "
                          "--thermal, --u-scan, --v-scan, --n-scan")
+
+    if args.sym_rdm:
+        sym_routes = [args.thermal, args.excited_singlet, args.t_scan, args.tT_surface,
+                      args.u_scan, args.v_scan, args.n_scan, args.build_bank]
+        if not any(sym_routes) or args.scan_U or args.scan_Ut:
+            parser.error("--sym-rdm works only with --thermal, --excited-singlet, --t-scan, "
+                         "--tT-surface, --u-scan, --v-scan, --n-scan or --build-bank")
 
     # ── Print topology reminder ────────────────────────────────────────────
     topo_info = {
@@ -832,6 +846,7 @@ def main():
                     save_pkl=True,
                     verbose=not sweeping,
                     n_max=args.bank_max_n,
+                    sym_rdm=args.sym_rdm,
                 )
             except Exception as e:                  # keep a long sweep alive
                 failed += 1
@@ -958,6 +973,7 @@ def main():
             spin_preserving=not args.full_hamiltonian,
             T_view_max=args.T_view_max,
             project_doublons=args.project_doublons,
+            sym_rdm=args.sym_rdm,
         )
 
         print(f"\n  Thermal plot : {result['plot_path']}")
@@ -1005,7 +1021,8 @@ def main():
             save_pkl=args.save_thermal_pkl,
             n_workers=args.n_workers,
             spin_preserving=not args.full_hamiltonian,
-            T_view_max=args.T_view_max
+            T_view_max=args.T_view_max,
+            sym_rdm=args.sym_rdm,
         )
         print(f"\n  Singlet bar plot : {result['bar_path']}")
         if result.get("pkl_path"):
@@ -1048,6 +1065,7 @@ def main():
             # scan; the singlet is re-located at every grid point
             excited_singlet=args.excited_singlet,
             singlet_k=args.singlet_k,
+            sym_rdm=args.sym_rdm,
         )
         print(f"\n  t-scan plot : {result['plot_path']}")
         if result.get("pkl_path"):
@@ -1094,6 +1112,7 @@ def main():
             force_recompute=args.force_thermal_recompute,
             save_pkl=args.save_thermal_pkl,
             n_max=args.tT_surface_max_n,
+            sym_rdm=args.sym_rdm,
         )
         print(f"\n  t-T 3D surface plot : {surf['plot_path']}")
         if surf.get("pkl_path"):
@@ -1143,6 +1162,7 @@ def main():
             excited_singlet=args.excited_singlet,
             singlet_k=args.singlet_k,
             project_doublons=args.project_doublons,
+            sym_rdm=args.sym_rdm,
         )
         print(f"\n  U-scan plot : {result['plot_path']}")
         if result.get("pkl_path"):
@@ -1179,6 +1199,7 @@ def main():
             excited_singlet=args.excited_singlet,
             singlet_k=args.singlet_k,
             project_doublons=args.project_doublons,
+            sym_rdm=args.sym_rdm,
         )
         print(f"\n  V-scan plot : {result['plot_path']}")
         if result.get("pkl_path"):
@@ -1216,6 +1237,7 @@ def main():
             excited_singlet=args.excited_singlet,
             singlet_k=args.singlet_k,
             project_doublons=args.project_doublons,
+            sym_rdm=args.sym_rdm,
         )
         print(f"\n  Ne-scan plot : {result['plot_path']}")
         if result.get("pkl_path"):
