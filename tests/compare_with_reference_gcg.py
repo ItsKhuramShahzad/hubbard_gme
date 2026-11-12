@@ -22,10 +22,21 @@ WHAT EACH STEP ESTABLISHES
   5  policy sweep           the reference solver run twice with ONE knob
                             flipped, to see which of the five choices moves
                             values on our data
+  6  restart convergence    the roof is monotone non-increasing in n_restarts,
+                            so sweeping it shows the budget each solver
+                            actually needs — and flags a start set that is not
+                            nested
+  7  bracket check          C_LB <= roof <= C_UB, each solver against BOTH
+                            brackets; this tests the bounds themselves, which
+                            the roof comparison cannot
+  8  cross-algorithm        our GCG vs reference GCG vs a Stiefel optimizer
+                            used only as a rough independent cross-check. GCG
+                            is the trusted solver; Stiefel can be well off (see
+                            the n=3 rows) and is NOT a reference value.
 
-Steps 1-4 compare the two solvers. Step 5 runs only on the reference solver,
-because our code does not expose those knobs — the question there is "would
-this policy be worth implementing in ours?".
+Steps 1-4 and 6-8 compare the two solvers. Step 5 runs only on the reference
+solver, because our code does not expose those knobs — the question there is
+"would this policy be worth implementing in ours?".
 
 USAGE
 -----
@@ -174,8 +185,7 @@ def step0(ref_dir: str) -> None:
     print("STEP 0 — reference self-check (validates the oracle before we trust it)")
     print("=" * 100)
     scripts = [
-        ("symbolic check vs Röthlisberger/Ma",
-         "scripts/verify_gcg_against_rothlisberger.py"),
+        ("symbolic check vs Röthlisberger/Ma", "scripts/verify_gcg_against_rothlisberger.py"),
         ("the note's own equations", "scripts/verify_gcg_notes_equations.py"),
     ]
     for label, rel in scripts:
@@ -436,12 +446,210 @@ def step5(cases, theirs, restarts: int, kmax: int, only: Optional[str]) -> None:
 
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Step 6: Restart convergence
+
+def step6(cases, ours, theirs, restart_grid, kmax: int) -> None:
+    """
+    Step 6: How many restarts does each solver need to converge to the same value? This step is not part of the original 5 steps, but it is useful to understand the convergence behavior of both solvers.
+    1. For each case, run both solvers with increasing number of restarts from the restart_grid.
+    2. Record the value of C_gcg for each number of restarts.
+    3. Compare the values obtained by both solvers and determine the minimum number of restarts needed for convergence.
+    4. Print a summary of the convergence behavior for each case.
+    5. Record the results in the ROWS list for later analysis.
+    6. This step can be time-consuming, especially for larger cases, so it is recommended to run it with a limited set of cases or with a smaller restart grid for quick analysis.
+    
+    The roof is minimum over a start set, and the start list for n_restarts=m is prefix of list for any larger m, 
+    so the reported value must be monotone non-increasing in n_restarts. Where it stops decreasing is the budget tath is actually required to reach the best value. This is a more robust measure of convergence than the k-loop count, which can be misleadingly small if the search gets stuck in a local minimum.
+    
+    """
+    print("\n" + "=" * 100)
+    print("STEP 6 — restart convergence: how many restarts are needed to reach the same value?")
+    print("=" * 100)
+    print("one row per solver: the roof at each restart budget, then the budget")
+    print("beyond which it stops improving")
+
+    def _plateau(values, grid, tol=1e-6):
+        """First restart count after which the value stops improving."""
+        for i in range(len(values) - 1):
+            if all(values[i] - v < tol for v in values[i + 1:]):
+                return grid[i]
+        return grid[-1]
+
+    def _monotone_violation(values):
+        """Largest increase between consecutive budgets (should be ~0)."""
+        return max([values[i + 1] - values[i] for i in range(len(values) - 1)]
+                   + [0.0])
+
+    print(f"  restart grid: {list(restart_grid)}")
+    for label, rho, n, _ in cases:
+        row_ours, row_ref = [], []
+
+        for r in restart_grid:
+            a, _, _, _, _ = _run_ours(ours, rho, n, r, kmax)
+            b, _, _, _, _ = _run_ref(theirs, rho, r, kmax)
+            row_ours.append(a)
+            row_ref.append(b)
+            record(step=6, case=label, solver="ours", value=a,
+                   setting=f"restarts={r}")
+            record(step=6, case=label, solver="reference", value=b,
+                   setting=f"restarts={r}")
+
+        pl_o, pl_r = _plateau(row_ours, restart_grid), _plateau(row_ref, restart_grid)
+        vio_o, vio_r = _monotone_violation(row_ours), _monotone_violation(row_ref)
+
+        print(f"\n  {label}")
+        print("    ours :  " + "  ".join(f"{v:.9f}" for v in row_ours)
+              + f"   -> plateau at r={pl_o}"
+              + ("" if vio_o < 1e-9 else f"   [NON-MONOTONE +{vio_o:.2e}]"))
+        print("    ref  :  " + "  ".join(f"{v:.9f}" for v in row_ref)
+              + f"   -> plateau at r={pl_r}"
+              + ("" if vio_r < 1e-9 else f"   [NON-MONOTONE +{vio_r:.2e}]"))
+        best = min(min(row_ours), min(row_ref))
+        print(f"    best value seen: {best:.9f}   "
+              f"(ours@max r: {row_ours[-1]:.9f}, ref@max r: {row_ref[-1]:.9f})")
+
+    print("\n  A larger restart budget can never report a worse value (the start")
+    print("  list is nested), so any NON-MONOTONE flag means the start set is not")
+    print("  a prefix. The plateau column is the budget actually required.")
+
+def step7(cases, ours, theirs, restarts: int, kmax: int) -> None:
+    """Is every roof inside both brackets, and do the brackets agree?
+
+    C_LB <= roof <= C_UB must hold for any correct solver. Comparing our bounds
+    against the reference's independent ones also tests the BOUNDS themselves,
+    which the roof comparison cannot: if our C_UB were wrong, every roof could
+    still look fine while the bracket is invalid.
+
+    The decisive column is "ref roof in OUR bracket" — it crosses the two
+    implementations, so a violation cannot be explained by one code's own
+    internal consistency.
+    """
+    from hubbard_gme.convex_roof import (convex_roof_lower_bound,
+                                         convex_roof_upper_bound)
+    from workflows.gme_mixed import bounds as refbounds
+
+    print("\n" + "=" * 100)
+    print("STEP 7 — bracket check: C_LB <= roof <= C_UB, ours against the reference's")
+    print("=" * 100)
+    hdr = (f"{'case':<24}{'our LB':>11}{'our roof':>12}{'our UB':>11}"
+           f"{'ref LB':>11}{'ref roof':>12}{'ref UB':>11}  verdict")
+    print(hdr)
+    print("-" * len(hdr))
+
+    TOL = 1e-6
+    n_bad = 0
+    for label, rho, n, _ in cases:
+        ours_lb = float(convex_roof_lower_bound(rho, n)["C_LB"])
+        ours_ub = float(convex_roof_upper_bound(rho, n)["C_UB"])
+        ref_lb = float(refbounds.c_lb(rho))
+        ref_ub = float(refbounds.c_ub(rho))
+
+        a, *_ = _run_ours(ours, rho, n, restarts, kmax)
+        b, *_ = _run_ref(theirs, rho, restarts, kmax)
+
+        checks = {
+            "our roof in our bracket": ours_lb - TOL <= a <= ours_ub + TOL,
+            "ref roof in ref bracket": ref_lb - TOL <= b <= ref_ub + TOL,
+            "ref roof in OUR bracket": ours_lb - TOL <= b <= ours_ub + TOL,
+            "our roof in REF bracket": ref_lb - TOL <= a <= ref_ub + TOL,
+        }
+        failed = [k for k, ok in checks.items() if not ok]
+        n_bad += len(failed)
+
+        print(f"{label:<24}{ours_lb:>11.6f}{a:>12.6f}{ours_ub:>11.6f}"
+              f"{ref_lb:>11.6f}{b:>12.6f}{ref_ub:>11.6f}  "
+              f"{'OK' if not failed else 'VIOLATION'}", flush=True)
+        for name in failed:
+            print(f"{'':<24}  !! {name}")
+
+        d_lb, d_ub = abs(ours_lb - ref_lb), abs(ours_ub - ref_ub)
+        if max(d_lb, d_ub) > 1e-6:
+            print(f"{'':<24}  brackets differ: |dLB|={d_lb:.2e}  |dUB|={d_ub:.2e}")
+
+        for who, lb, roof, ub in (("ours", ours_lb, a, ours_ub),
+                                  ("reference", ref_lb, b, ref_ub)):
+            record(step=7, case=label, solver=who, setting="C_LB", value=lb)
+            record(step=7, case=label, solver=who, setting="roof", value=roof)
+            record(step=7, case=label, solver=who, setting="C_UB", value=ub)
+
+    print("-" * len(hdr))
+    print(f"  bracket violations: {n_bad}"
+          + ("  — every roof lies inside both brackets" if n_bad == 0 else ""))
+
+
+def step8(cases, ours, theirs, stiefel_crosscheck, restarts: int, kmax: int) -> None:
+    """Cross-ALGORITHM check, not just cross-implementation.
+
+    Steps 1-4 compare two implementations of the SAME method (GCG). If GCG as a
+    method carried a systematic bias, both would show it identically and the
+    comparison would never reveal it. The reference also ships an independent
+    optimizer — a Givens parametrisation on St(k,r), stiefel.py — which its own
+    suite checks GCG against. Running all three tests the method, not the code.
+
+    Reading it: if the two GCG solvers agree but Stiefel is consistently lower,
+    that points at a GCG-method bias rather than at either implementation.
+    """
+    print("\n" + "=" * 100)
+    print("STEP 8 — cross-algorithm: our GCG vs reference GCG vs a Stiefel cross-check")
+    print("=" * 100)
+    hdr = (f"{'case':<24}{'our GCG':>14}{'ref GCG':>14}{'Stiefel':>14}"
+           f"{'spread':>12}{'exact':>11}  verdict")
+    print(hdr)
+    print("-" * len(hdr))
+
+    TOL = 1e-6
+    n_stiefel_lower = 0
+    analytic_fail = []
+    for label, rho, n, exact in cases:
+        a, *_ = _run_ours(ours, rho, n, restarts, kmax)
+        b, *_ = _run_ref(theirs, rho, restarts, kmax)
+        res_s = stiefel_crosscheck(rho, n_restarts=restarts, k_extra_max=kmax)
+        c = float(res_s.get("value", np.nan))
+
+        vals = [v for v in (a, b, c) if np.isfinite(v)]
+        spread = (max(vals) - min(vals)) if vals else float("nan")
+        # does the third algorithm beat BOTH GCG runs?
+        if np.isfinite(c) and c < min(a, b) - TOL:
+            n_stiefel_lower += 1
+
+        ex = f"{exact:.6f}" if exact is not None else "-"
+        print(f"{label:<24}{a:>14.9f}{b:>14.9f}{c:>14.9f}{spread:>12.2e}{ex:>11}  "
+              f"{'agree' if spread < TOL else 'differ'}", flush=True)
+
+        if exact is not None:
+            for who, val in (("our GCG", a), ("ref GCG", b), ("Stiefel x-check", c)):
+                if abs(val - exact) > 1e-4:
+                    analytic_fail.append(f"{label}: {who}={val:.9f} exact={exact:.9f}")
+                    print(f"{'':<24}  !! {who} misses the analytic value by "
+                          f"{abs(val - exact):.2e}")
+
+        for who, val in (("ours", a), ("reference", b), ("stiefel_crosscheck", c)):
+            record(step=8, case=label, solver=who, setting="roof", value=val,
+                   exact="" if exact is None else exact)
+
+    print("-" * len(hdr))
+    if analytic_fail:
+        print("  !! ANALYTIC MISMATCH — identifies which solver is wrong:")
+        for line in analytic_fail:
+            print(f"     {line}")
+    elif n_stiefel_lower > len(cases) // 2:
+        print(f"  Stiefel beat both GCG runs on {n_stiefel_lower}/{len(cases)} cases "
+              f"— possible GCG-method bias, worth investigating")
+    else:
+        print(f"  Stiefel lower on {n_stiefel_lower}/{len(cases)} cases — no sign "
+              f"of a method-level bias; differences look like search luck")
+
+
+    
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--ref", default=DEFAULT_REF)
     ap.add_argument("--step", action="append", default=None,
-                    choices=["0", "1", "2", "3", "4", "5", "all"])
+                    choices=["0", "1", "2", "3", "4", "5", "6", "7", "8", "all"])
+    ap.add_argument("--restart-grid", type=int, nargs="+",
+                    default=[2, 5, 10, 20, 40], dest="restart_grid",
+                    help="step 6: restart budgets to sweep")
     ap.add_argument("--cases", default="both", choices=["analytic", "real", "both"])
     ap.add_argument("--policy", default=None, choices=sorted(POLICY_SWEEP))
     ap.add_argument("--restarts", type=int, default=8)
@@ -458,7 +666,7 @@ def main() -> None:
 
     steps = args.step or ["all"]
     if "all" in steps:
-        steps = ["0", "1", "2", "3", "4", "5"]
+        steps = ["0", "1", "2", "3", "4", "5", "6", "7", "8"]
 
     if not os.path.isdir(args.ref):
         sys.exit(f"gcg_reference not found at {args.ref}   (pass --ref PATH)")
@@ -468,6 +676,9 @@ def main() -> None:
     from workflows.gme_mixed.gcg import convex_roof_gcg as theirs
     from workflows.gme_mixed import benchmarks as bench
     from workflows.gme_mixed import pure as refpure
+    # the reference's SECOND, independent optimizer (Givens on St(k,r)) — a
+    # different algorithm, not just a different implementation of GCG
+    from workflows.gme_mixed.stiefel import convex_roof_stiefel as stiefel_crosscheck
 
     ana = analytic_cases(bench, args.quick)
     real = real_cases((2, 3) if args.quick else (2, 3, 4, 5),
@@ -506,6 +717,16 @@ def main() -> None:
             print(f"\n[skip] step 4: no cached RDMs under {CACHE}")
     if "5" in steps:
         step5(cases5, theirs, args.restarts, args.kmax, args.policy)
+    if "6" in steps:
+        # expensive: the solver runs once per restart budget, per case, per side
+        cases6 = (real + ana) if args.full else (real or ana)[:3]
+        step6(cases6, ours, theirs, args.restart_grid, args.kmax)
+    if "7" in steps:
+        # bounds are closed-form, so this is cheap — give it everything
+        step7(ana + real, ours, theirs, args.restarts, args.kmax)
+    if "8" in steps:
+        cases8 = (ana + real) if args.full else (ana[:6] + real[:2])
+        step8(cases8, ours, theirs, stiefel_crosscheck, args.restarts, args.kmax)
 
     if args.csv and ROWS:
         keys = ["step", "case", "solver", "setting", "value", "exact", "diff",

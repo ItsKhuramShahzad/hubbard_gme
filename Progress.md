@@ -48,6 +48,11 @@ Cache convention is **v1** (default; cache filenames are tagged `..._v1_...`).
 | Fast unit tests | Pass | 77 tests pass (metrics/hamiltonian/rdm/gme/meyerwallach/contract) |
 | Convex-roof integration tests | Slow | `test_canonical_parameters`, `test_convex_roof`, `test_mixed_states` run real optimisation (minutes); not part of the quick pass |
 | Scientific numerical validation | Ongoing | Ground-state E0 confirmed; thermal/scan values to be cross-checked |
+| Cross-check vs `gcg_reference` | Done | 9-step suite, `tests/compare_with_reference_gcg.py`; agree to 8e-13 on analytics, 1.2e-15 on pure states, 0 bracket violations |
+| Restart-budget convergence | **Action needed** | 8-10 restarts insufficient for n>=4; 40 required (see Plan.md 8b) |
+| `h(U)` value-only fix | Done 2026-08-22 | `_h_full_unitary` no longer computes discarded gradients: 1.24x, identical results |
+| HPC job restructuring | Planned | `Plan_HPC_Scaling.md`: split by (point, n), 1 CPU/task, `merge_scan_pkls` |
+| Production figure regeneration | **Pending** | all n>=4 figures must be re-run at 40 restarts |
 
 ---
 
@@ -207,14 +212,28 @@ from "three tasks" to "four tasks".
 
 ---
 
-## 6. Recommended Next Actions
+## 6. Recommended Next Actions  (updated 2026-08-22)
 
-1. Run Task 4 (U-scan) and confirm its PDF/PKL outputs.
-2. Align `verify_project.py` cache-version default with `v1`.
-3. Run `scripts/verify_project.py --mode all --cache-version v1` in `qchem`.
-4. Run the slow convex-roof integration tests with a long timeout.
-5. Cross-check thermal/scan numerical values against the PRA reference limits.
-6. Add `run_U_dependence_gme` to `__init__.__all__`.
+Ordered by what blocks the paper.
+
+1. **Stage 0 of `Plan_HPC_Scaling.md`** — on the cluster, measure 1 vs 8 threads
+   at L=8 and record `MaxRSS`. ~1 h, decides `--cpus-per-task` and `--mem`.
+2. **Write `merge_scan_pkls`** in `thermal_pipeline.py` (template:
+   `merge_tT_surface_pkls`, line 2877) and wire `--merge-scan` in `main.py`
+   (template: `--merge-surface`, lines 329 / 734).
+3. **Dry run** the split array with `--array=0-6` (one grid point, all n) and
+   test the merge on those 7 parts.
+4. **Launch** the full `--array=0-146` for the U-scan; ~3 days at 8 slots.
+5. **Merge -> replot** and check the figure against the old one.
+6. Repeat for the t-scan and V-scan, L=6 and L=8, gs and excited singlet.
+7. Only then finalise `N_r` in the paper's numerical-approach section. Until the
+   figures are regenerated the text must say `N_r = 10`, which is what the
+   current data used.
+
+Deferred (not blocking):
+
+* align `verify_project.py` cache-version default with `v1`
+* run the slow convex-roof integration tests with a long timeout
 
 ---
 
@@ -247,10 +266,21 @@ Next action:
 
 ---
 
-## 8. Current Conclusion
+## 8. Current Conclusion  (updated 2026-08-22)
 
-The single-point ground-state pipeline and the thermal/excited/t-scan tasks (Tasks 1–3)
-are working and have produced PDFs on 2026-06-29. The remaining practical work is:
-run and verify Task 4 (U-scan), align the verify-script cache-version default with `v1`,
-run the slow convex-roof integration tests, and cross-check the thermal/scan numerical
-results against the reference limits.
+The implementation is verified correct: it reproduces the analytic roofs (GHZ,
+W, M-families) to machine precision and agrees with an independently written
+implementation of the same algorithm to 8e-13 on analytic cases and 1.2e-15 on
+pure states, with zero bracket violations.
+
+The open issue is **not correctness but convergence**. The production runs used
+8-10 restarts, and at n>=4 that is demonstrably too few: at n=5 a 20-restart run
+sits in a spurious local minimum 3.6e-03 above the value 40 restarts reaches.
+Every figure involving n>=4 (45 of the 49 cached scans) must be regenerated at
+`--n-restarts 40`.
+
+That regeneration is infeasible with the current job structure (~23 days for one
+serial scan, over the 14-day limit). `Plan_HPC_Scaling.md` sets out the fix:
+split the scan array by (grid point, n), drop to 1 CPU per task because BLAS
+threading slows the solver, and add `merge_scan_pkls` to reassemble. Projected
+~3 days per scan.

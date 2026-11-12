@@ -413,6 +413,32 @@ stronger settings for final runs.
 
 ---
 
+## 8b. Solver settings required for publication  (added 2026-08-22)
+
+Convergence testing against `gcg_reference` established that the settings used
+for the 2026-06/07 production runs are **not sufficient** for the larger
+clusters:
+
+| setting | old runs | required | evidence |
+|---|---:|---:|---|
+| `--n-restarts` | 8-10 | **40** | at n=5, 20 restarts returns 0.401486 (spurious basin); 40 reaches 0.397912 |
+| `--max-iter` | 200 | **300** | 150 costs 1.0e-05 vs 300; 600 gains only 7e-07 |
+| `--k-max-extra` | 4-5 | **>= 10** | at n=4 (rank 11) four of six runs converged at k=17, i.e. the kmax=6 ceiling, not convergence |
+
+At 40 restarts a single serial scan needs ~23 days, over the 14-day `ulow`
+limit. The job must be split — see **`Plan_HPC_Scaling.md`** for the full
+strategy (array split by (grid point, n), 1 CPU per task, and `merge_scan_pkls`).
+
+Two solver facts measured while establishing this:
+
+* BLAS threading **slows the convex roof down** (8 threads 28% slower than 1);
+  the matrices are too small to thread. Use `OMP_NUM_THREADS=1`.
+* `_h_full_unitary` called the *with-gradient* measure and discarded the
+  gradient on every cost evaluation (22 per gradient). Switching it to the
+  `"value"` entry of `MEASURES` gives **1.24x** with bit-identical results.
+
+---
+
 ## 9. Recommended Commands
 
 ### Debug (fast)

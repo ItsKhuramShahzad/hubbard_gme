@@ -232,7 +232,48 @@ def _save_thermal_result_pkl(
     with open(tmp_path, "wb") as f:
         pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
     os.replace(tmp_path, cache_path)
+    _emit_latex_figure(cache_path)
     return str(cache_path)
+
+
+# Set HUBBARD_GME_NO_LATEX=1 to turn the automatic LaTeX export off.
+_LATEX_FIGS_DIRNAME = "latex_figs"
+
+
+def _emit_latex_figure(cache_path: Path) -> Optional[str]:
+    """Write the PGFPlots version of a scan next to its PDF.
+
+    Called right after the result pkl lands, so every scan produces its LaTeX
+    figure in the same run that produces the matplotlib PDF, with no separate
+    step to remember.  Deliberately best-effort: a failure here must never lose
+    a solve that may have taken hours, so all errors are reported and swallowed.
+    """
+    if os.environ.get("HUBBARD_GME_NO_LATEX"):
+        return None
+    try:
+        import importlib.util
+
+        script = (Path(__file__).resolve().parents[2]
+                  / "scripts" / "pkl_to_latex.py")
+        if not script.exists():
+            return None
+        spec = importlib.util.spec_from_file_location("_pkl_to_latex", script)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        outdir = Path.cwd() / _LATEX_FIGS_DIRNAME
+        # use captions.txt from the project root when the author has written one
+        caps = Path(__file__).resolve().parents[2] / "captions.txt"
+        if caps.exists():
+            mod.CAPTIONS = mod.load_captions(str(caps))
+
+        out = mod.convert(str(cache_path), str(outdir), verbose=False)
+        if out:
+            print(f"  LaTeX figure -> {out}")
+        return out
+    except Exception as exc:                    # never break a completed scan
+        print(f"  (LaTeX figure skipped: {type(exc).__name__}: {exc})")
+        return None
 
 
 def _load_thermal_result_pkl(cache_path: Path) -> dict:
@@ -1798,10 +1839,23 @@ def find_first_excited_singlet(
         print(f"  {row['idx']:>3}  {row['energy']:>14.8f}  "
               f"{row['S2']:>8.4f}  {row['S']:>5.3f}  {row['spin_label']}")
 
-    # Ground state must be singlet; find NEXT singlet (skip triplets etc.)
+    # Ground state must be singlet; find NEXT singlet (skip triplets etc.).
+    # A bare next() raises StopIteration here, which surfaces as an opaque
+    # traceback: at U=0 (or t=0) the whole low manifold is degenerate, every
+    # <S^2> is a mixture, and NO eigenvector is a spin eigenstate at all.
     gs_singlet = next(
-        r for r in spin_table if abs(r["S"]) < 0.05
+        (r for r in spin_table if abs(r["S"]) < 0.05), None
     )
+    if gs_singlet is None:
+        s_min = min((abs(r["S"]) for r in spin_table), default=float("nan"))
+        raise RuntimeError(
+            f"No singlet (S=0) among the first {k} eigenstates: the smallest "
+            f"|S| found is {s_min:.3f}. This is the signature of a DEGENERATE "
+            f"manifold - at U=0 or t=0 the eigensolver returns arbitrary "
+            f"mixtures of degenerate states rather than spin eigenstates. "
+            f"Start the scan just off the degenerate point (e.g. U>=0.1, "
+            f"t>=0.05) or raise --singlet-k."
+        )
     excited_singlets = [
         r for r in spin_table
         if abs(r["S"]) < 0.05 and r["idx"] != gs_singlet["idx"]

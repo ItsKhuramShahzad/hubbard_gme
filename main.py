@@ -620,7 +620,7 @@ def main():
             r["Sz"] = float(Sz_clean[k_])
         sector = "Sz=0 sector" if sp else "full Hamiltonian (all Sz)"
         print(f"\n  Eigenstate spectrum — L={args.L}, t={args.t}, U={args.U} "
-              f"(t/U={args.t/args.U:.4g}), Ne={ne}, mode={args.mode} [{sector}]")
+              f", Ne={ne}, mode={args.mode} [{sector}]")
         print(f"  {'idx':>3}  {'E':>12}  {'<S^2>':>8}  {'S':>5}  {'Sz':>6}  label")
         print("  " + "-" * 60)
         def _z(x):  # clamp tiny negatives so they don't print as -0.0000
@@ -1094,6 +1094,15 @@ def main():
         # Negative U (attractive Hubbard) is physically valid, so it is allowed.
         if args.u_scan_max <= args.u_scan_min:
             parser.error("--u-scan-max must be greater than --u-scan-min")
+        # U=0 is degenerate: the eigensolver returns arbitrary mixtures of the
+        # degenerate manifold, no eigenvector is a spin eigenstate, and the
+        # singlet search fails minutes into the run. Reject it here instead,
+        # the way --t-scan-min already does.
+        if args.excited_singlet and abs(args.u_scan_min) < 1e-12:
+            parser.error(
+                "--u-scan-min must be non-zero with --excited-singlet: at U=0 "
+                "the manifold is degenerate and no singlet can be identified "
+                "(use e.g. --u-scan-min 0.1)")
         U_values = np.linspace(args.u_scan_min, args.u_scan_max, args.u_scan_steps)
 
         result = run_U_dependence_gme(

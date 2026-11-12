@@ -199,6 +199,8 @@ def _cgme_pure_vector_robust(psi, n, tie_tol=TIE_TOL):
     # VALUE policy: exact maximum (no averaging) — see TIE_TOL note above.
     max_p = max(purities)
     return float(np.sqrt(max(0.0, 2.0 * (1.0 - max_p))))
+
+
 def _cgme_pure_dm(rho_pure: np.ndarray, n: int) -> float:
     """C_GME for a pure state given as density matrix."""
     purities = [purity(partial_trace_spins(rho_pure, n, A))
@@ -1120,14 +1122,15 @@ def _cgme_pure_with_grad(psi: np.ndarray, n: int,
       the Clarke subdifferential and gives smooth behaviour through symmetric
       states (GHZ, W, ...), where the classical derivative does not exist.
     """
+    
     psi_tensor = psi.reshape([2] * n)
-    biparts    = get_bipartitions(n)
+    biparts    = get_bipartitions(n) # Get all bipartation of Set A
 
     # ---- Pass 1: store reshape data + purity for every bipartition ----
     bp_data = []   # (purity, M, perm, A, rho_A)
     for A in biparts:
         B    = tuple(i for i in range(n) if i not in A)
-        perm = list(A) + list(B)
+        perm =  list(A) + list(B)
         M    = np.transpose(psi_tensor, perm).reshape(2**len(A), 2**len(B))
         rho_A = M @ M.conj().T
         pur_A = float(np.real(np.trace(rho_A @ rho_A)))
@@ -1162,13 +1165,18 @@ def _cgme_pure_with_grad(psi: np.ndarray, n: int,
     # ---- Averaged Wirtinger subgradient over the active bipartitions ----
     grad_psi_conj = np.zeros(2**n, dtype=complex)
     for _, M, perm, A, rho_A in active:
-        grad_M     = 2.0 * (rho_A @ M)
-        grad_block = grad_M.reshape([2] * len(A) + [2] * (n - len(A)))
-        grad_block = np.transpose(grad_block, np.argsort(perm))
-        grad_psi_conj += grad_block.reshape(2**n)
-    grad_psi_conj /= n_active
+        #P = Tr(rho_A squared)      where rho_A = M M†
+        # P = Tr( M M† M M† )
+        # d/dx (x squared) = 2x
+        # dP/dM = 2 * (M M†) * M  =  2 * rho_A * M
 
-    grad_conj = -grad_psi_conj / C_safe
+        grad_M     = 2.0 * (rho_A @ M) #  <- DERIVATIVE OF PURITY taken here
+        grad_block = grad_M.reshape([2] * len(A) + [2] * (n - len(A))) # same numbers, just moved back
+        grad_block = np.transpose(grad_block, np.argsort(perm))  #  into psi's index order
+        grad_psi_conj += grad_block.reshape(2**n)  
+    grad_psi_conj /= n_active  # average over tied cuts
+ 
+    grad_conj = -grad_psi_conj / C_safe  # convert purity-slope into C-slope
     return C, grad_conj
 
 #convert U into pure states
@@ -1211,14 +1219,14 @@ def _h_full_unitary(
     """
     Cost h(U) = Σ_i p_i · C_GME(|ψ_i>) for U ∈ U(k).
     """
-    m_grad_fn = _resolve_measure(measure)["grad"]
+    m_value_fn = _resolve_measure(measure)["value"]  # only need the value, not the gradient
     probs, pure_states = _decompose_full_unitary(U, eigvecs, eigvals_sqrt)
     total = 0.0
     for i in range(probs.shape[0]):
         if probs[i] < 1e-14:
             continue
-        C, _ = m_grad_fn(pure_states[i], n)
-        total += probs[i] * C
+        # C, _ = m_grad_fn(pure_states[i], n)
+        total += probs[i] * m_value_fn(pure_states[i], n)
     return total
 
 
@@ -2241,8 +2249,8 @@ def _meyerwallach_pure_with_grad(psi: np.ndarray, n: int) -> tuple:
 
 MEASURES = {
     "cgme": {
-        "value": _cgme_pure_vector_robust,
-        "grad":  _cgme_pure_with_grad,
+        "value": _cgme_pure_vector_robust, # compute C_GME robustly
+        "grad":  _cgme_pure_with_grad,  # compute C_GME and its Wirtinger gradient
     },
     "meyerwallach": {
         "value": _meyerwallach_pure_vector,
