@@ -444,6 +444,12 @@ def build_parser() -> argparse.ArgumentParser:
                            dest="full_hamiltonian",
                            help="Use complete Hamiltonian (all Sz sectors). "
                                 "Default: Sz=0 sector only (spin_preserving=True).")
+    therm_grp.add_argument("--project-doublons", action="store_true",
+                           dest="project_doublons",
+                           help="Remove the configurations with a doublon on the n "
+                                "sites of each cluster before building the nBRDM, "
+                                "without renormalising (PKLs tagged _proj1). "
+                                "Only with --thermal, --u-scan, --v-scan or --n-scan.")
     therm_grp.add_argument("--T-view-max", type=float, default=None, dest="T_view_max",
                        help="Cap the thermal-plot x-axis at this T (view only; "
                             "does not change the data). Default: auto-clip.")
@@ -541,6 +547,14 @@ def _cache_kwargs(args) -> dict:
 def main():
     parser = build_parser()
     args   = parser.parse_args()
+
+    if args.project_doublons:
+        routes = [args.thermal, args.u_scan, args.v_scan, args.n_scan]
+        others = [args.build_bank, args.t_scan, args.tT_surface,
+                  args.scan_U, args.scan_Ut]
+        if sum(map(bool, routes)) != 1 or any(others):
+            parser.error("--project-doublons works only with exactly one of "
+                         "--thermal, --u-scan, --v-scan, --n-scan")
 
     # ── Print topology reminder ────────────────────────────────────────────
     topo_info = {
@@ -942,7 +956,8 @@ def main():
             n_workers=args.n_workers,
             average_site_clusters=args.thermal_average_site_clusters,
             spin_preserving=not args.full_hamiltonian,
-            T_view_max=args.T_view_max
+            T_view_max=args.T_view_max,
+            project_doublons=args.project_doublons,
         )
 
         print(f"\n  Thermal plot : {result['plot_path']}")
@@ -1127,6 +1142,7 @@ def main():
             # scan; the singlet is re-located at every grid point
             excited_singlet=args.excited_singlet,
             singlet_k=args.singlet_k,
+            project_doublons=args.project_doublons,
         )
         print(f"\n  U-scan plot : {result['plot_path']}")
         if result.get("pkl_path"):
@@ -1162,6 +1178,7 @@ def main():
             spin_preserving=not args.full_hamiltonian,
             excited_singlet=args.excited_singlet,
             singlet_k=args.singlet_k,
+            project_doublons=args.project_doublons,
         )
         print(f"\n  V-scan plot : {result['plot_path']}")
         if result.get("pkl_path"):
@@ -1198,6 +1215,7 @@ def main():
             spin_preserving=False,   # full Hilbert space (required for the Ne-scan)
             excited_singlet=args.excited_singlet,
             singlet_k=args.singlet_k,
+            project_doublons=args.project_doublons,
         )
         print(f"\n  Ne-scan plot : {result['plot_path']}")
         if result.get("pkl_path"):

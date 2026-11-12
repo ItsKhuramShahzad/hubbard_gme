@@ -90,16 +90,28 @@ def occ_op(sites):
     return op
 
 
-def omega(psis, L, K, n, sp):
-    """omega_n = <prod_{s<n} n_s>, averaged over the degenerate states (= Tr of the averaged Gamma)."""
+def single_occ_op(sites, L, K, sp):
+    """prod_s (n_up + n_dn - 2 n_up n_dn): 1 if each site holds exactly one electron, else 0."""
+    op = FermionOperator("")
+    for s in sites:
+        up, dn = FermionOperator(((2 * s, 1), (2 * s, 0))), FermionOperator(((2 * s + 1, 1), (2 * s + 1, 0)))
+        op = op * (up + dn - 2 * up * dn)
+    return get_number_preserving_sparse_operator(op, 2 * L, K, spin_preserving=sp)
+
+
+def omega(psis, L, K, n, sp, project_doublons=False):
+    """omega_n = <prod_{s<n} n_s>, averaged over the degenerate states (= Tr of the averaged Gamma).
+    project_doublons=True: probability of exactly one electron on each of the n sites."""
+    if project_doublons:
+        return float(np.mean([np.real(np.vdot(p, single_occ_op(range(n), L, K, sp) @ p)) for p in psis]))
     M = get_number_preserving_sparse_operator(occ_op(range(n)), 2 * L, K, spin_preserving=sp)
     return float(np.mean([np.real(np.vdot(p, M @ p)) for p in psis]))
 
 
-def rho_s(psis, L, K, n, sp):
+def rho_s(psis, L, K, n, sp, project_doublons=False):
     """rho_s on sites 0..n-1, built as run_U_dependence_gme does (degenerate states averaged, divided by the trace)."""
     from hubbard_gme.thermal_pipeline import _precompute_ops, _rdm_from_ops
-    ops = _precompute_ops(tuple(range(n)), 2 * L, K, spin_preserving=sp)
+    ops = _precompute_ops(tuple(range(n)), 2 * L, K, spin_preserving=sp, project_doublons=project_doublons)
     raw = sum(_rdm_from_ops(ops, p, n) for p in psis) / len(psis)
     tr = np.real(np.trace(raw))
     return raw / tr if abs(tr) > ZERO_TRACE else raw

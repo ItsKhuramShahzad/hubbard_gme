@@ -50,6 +50,7 @@ from typing import Optional, Sequence
 
 from openfermion import FermionOperator
 from openfermion.linalg import get_number_preserving_sparse_operator
+from openfermion.linalg.sparse_tools import _iterate_basis_
 
 from .hamiltonian import (
     build_hubbard_hamiltonian,
@@ -161,6 +162,11 @@ def _sector_label(spin_preserving: bool) -> str:
     return "Sz=0 sector" if spin_preserving else "full Hamiltonian (all Sz)"
 
 
+def _proj_tag(project_doublons: bool) -> str:
+    """Filename tag of a projected run; empty otherwise, so existing names stay valid."""
+    return "_proj1" if project_doublons else ""
+
+
 def _thermal_cache_path(
     *,
     analysis_type: str,
@@ -187,6 +193,7 @@ def _thermal_cache_path(
     cutoff_increment: float = 5.0,
     k: Optional[int] = None,
     spin_preserving: bool = True,
+    project_doublons: bool = False,
 ) -> Path:
     """Deterministic PKL path for one thermal-pipeline run."""
     k_tag = "none" if k is None else str(int(k))
@@ -207,7 +214,7 @@ def _thermal_cache_path(
         f"adaptive{int(bool(adaptive_cutoff))}_step{_safe_float_tag(cutoff_increment)}_"
         f"clusteravg{int(bool(average_site_clusters))}_"
         f"{grid_tag}_"
-        f"k{k_tag}_diag0.pkl"
+        f"k{k_tag}_diag0{_proj_tag(project_doublons)}.pkl"
     )
     return _thermal_runs_dir() / filename
 
@@ -339,6 +346,7 @@ def _rdm_bank_cache_path(
     spin_preserving: bool = True,
     n_max: Optional[int] = None,
     V: float = 0.0,
+    project_doublons: bool = False,
 ) -> Path:
     """
     Deterministic path for the generic RDM bank (energies + averaged Γ^(n)).
@@ -359,7 +367,7 @@ def _rdm_bank_cache_path(
         f"mode-{mode}_tp{_optional_float_tag(t_prime)}_"
         f"t2{_optional_float_tag(t2)}_tperp{_optional_float_tag(t_perp)}{v_tag}_"
         f"nmin{n_min}{nmax_tag}_{_sector_tag(spin_preserving)}_"
-        f"clusteravg{int(bool(average_site_clusters))}.pkl"
+        f"clusteravg{int(bool(average_site_clusters))}{_proj_tag(project_doublons)}.pkl"
     )
     return _rdm_bank_dir() / filename
 
@@ -391,18 +399,78 @@ def _load_thermal_rdm_bank_pkl(cache_path: Path) -> Optional[dict]:
 
 # ── Precomputed operator tables ───────────────────────────────────────────────
 
+def _basis_occupations(n_so: int, n_electrons: int,
+                       spin_preserving: bool = True) -> np.ndarray:
+    """
+    Occupation bits of every configuration, in the order of the state vectors.
+
+    Row c is entry c of an eigenvector; column 2j is site j spin up and
+    column 2j+1 is site j spin down (shape: n_configurations x n_so, bool).
+    """
+    reference = np.array([k < n_electrons for k in range(n_so)])
+    return np.asarray(
+        list(_iterate_basis_(reference, n_electrons, spin_preserving)), dtype=bool
+    )
+
+
+def _doublon_mask(sites: Sequence[int], occupations: np.ndarray) -> np.ndarray:
+    """m_c = 0 if any site of the cluster is doubly occupied in c, else 1."""
+    up = occupations[:, [2 * s for s in sites]]
+    down = occupations[:, [2 * s + 1 for s in sites]]
+    return (~np.any(up & down, axis=1)).astype(float)
+
+
+def _cluster_doublon_mask(sites: tuple, n_so: int, n_electrons: int,
+                          spin_preserving: bool = True) -> np.ndarray:
+    """
+    Doublon mask of one cluster, m_c, in the order of the state vectors.
+
+    The sites outside the cluster are not restricted. _iterate_basis_ is private
+    to OpenFermion, so its order is checked against the number operators of the
+    cluster spin-orbitals before the mask is used.
+    """
+    occupations = _basis_occupations(n_so, n_electrons, spin_preserving)
+    for orbital in [k for s in sites for k in (2 * s, 2 * s + 1)]:
+        number = get_number_preserving_sparse_operator(
+            FermionOperator(((orbital, 1), (orbital, 0))),
+            n_so, n_electrons, spin_preserving=spin_preserving,
+        )
+        if not np.array_equal(number.diagonal().real > 0.5, occupations[:, orbital]):
+            raise RuntimeError(
+                f"Basis order mismatch for spin-orbital {orbital}: the doublon "
+                "mask would be applied to the wrong amplitudes."
+            )
+    return _doublon_mask(sites, occupations)
+
+
+class _OperatorTable(dict):
+    """
+    Operator table {(bra_idx, ket_idx): sparse_matrix} of one site cluster.
+
+    mask is the doublon mask of the cluster, or None for the ordinary nBRDM.
+    """
+
+    mask: Optional[np.ndarray] = None
+
+
 def _precompute_ops(sites: tuple, n_so: int, n_electrons: int,
-                    spin_preserving: bool = True) -> dict:
+                    spin_preserving: bool = True,
+                    project_doublons: bool = False) -> dict:
     """
     Build the (2^n)^2 sparse operator table for compute_general_nRDM
     for a fixed site cluster.  Operators depend only on sites, not on
     any wavefunction, so they can be reused across all eigenstates.
 
-    Returns dict {(bra_idx, ket_idx): sparse_matrix}.
+    project_doublons=True leaves the operators unchanged and stores the doublon
+    mask of the cluster in the table; _rdm_from_ops then uses the masked state.
+
+    Returns _OperatorTable {(bra_idx, ket_idx): sparse_matrix}.
     """
     n = len(sites)
     dim = 2 ** n
-    ops = {}
+    ops = _OperatorTable()
+    if project_doublons:
+        ops.mask = _cluster_doublon_mask(sites, n_so, n_electrons, spin_preserving)
     for bra in range(dim):
         bra_spins = [(bra >> k) & 1 for k in range(n)]
         for ket in range(dim):
@@ -420,8 +488,15 @@ def _precompute_ops(sites: tuple, n_so: int, n_electrons: int,
     return ops
 
 
-def _rdm_from_ops(ops: dict, psi: np.ndarray, n: int) -> np.ndarray:
-    """Evaluate ρ[bra,ket] = ⟨ψ|O_{bra,ket}|ψ⟩ using precomputed operators."""
+def _rdm_from_ops(ops: _OperatorTable, psi: np.ndarray, n: int) -> np.ndarray:
+    """
+    Evaluate ρ[bra,ket] = ⟨ψ|O_{bra,ket}|ψ⟩ using precomputed operators.
+
+    If the table holds a doublon mask, ψ is first replaced by ψ_P: a copy with the
+    configurations with a doublon on the cluster set to zero, not renormalised.
+    """
+    if ops.mask is not None:
+        psi = psi * ops.mask
     dim = 2 ** n
     rho = np.zeros((dim, dim), dtype=complex)
     for (bra, ket), op in ops.items():
@@ -433,6 +508,7 @@ _THERMAL_WORKER_EIGVECS: Optional[np.ndarray] = None
 _THERMAL_WORKER_N_SO: Optional[int] = None
 _THERMAL_WORKER_N_ELECTRONS: Optional[int] = None
 _THERMAL_WORKER_SPIN_PRESERVING: bool = True
+_THERMAL_WORKER_PROJECT_DOUBLONS: bool = False
 
 
 def _init_thermal_rdm_worker(
@@ -440,16 +516,19 @@ def _init_thermal_rdm_worker(
     n_so: int,
     n_electrons: int,
     spin_preserving: bool = True,
+    project_doublons: bool = False,
 ) -> None:
     """Initialise multiprocessing worker state for RDM-bank jobs."""
     global _THERMAL_WORKER_EIGVECS
     global _THERMAL_WORKER_N_SO
     global _THERMAL_WORKER_N_ELECTRONS
     global _THERMAL_WORKER_SPIN_PRESERVING
+    global _THERMAL_WORKER_PROJECT_DOUBLONS
     _THERMAL_WORKER_EIGVECS = eigvecs
     _THERMAL_WORKER_N_SO = int(n_so)
     _THERMAL_WORKER_N_ELECTRONS = int(n_electrons)
     _THERMAL_WORKER_SPIN_PRESERVING = bool(spin_preserving)
+    _THERMAL_WORKER_PROJECT_DOUBLONS = bool(project_doublons)
 
 
 def _reset_thermal_rdm_worker() -> None:
@@ -465,10 +544,12 @@ def _compute_cluster_rdm_bank(
     n_so: int,
     n_electrons: int,
     spin_preserving: bool = True,
+    project_doublons: bool = False,
 ) -> tuple[int, tuple, np.ndarray, float]:
     """Compute Γ^(n)[ψ_m] for one site cluster and all eigenstates."""
     t0 = time.time()
-    ops = _precompute_ops(sites, n_so, n_electrons, spin_preserving=spin_preserving)
+    ops = _precompute_ops(sites, n_so, n_electrons, spin_preserving=spin_preserving,
+                          project_doublons=project_doublons)
     n_states = eigvecs.shape[1]
     dim = 2 ** n
     rdms = np.zeros((n_states, dim, dim), dtype=complex)
@@ -493,6 +574,7 @@ def _thermal_rdm_cluster_worker(args):
         _THERMAL_WORKER_N_SO,
         _THERMAL_WORKER_N_ELECTRONS,
         spin_preserving=_THERMAL_WORKER_SPIN_PRESERVING,
+        project_doublons=_THERMAL_WORKER_PROJECT_DOUBLONS,
     )
 
 
@@ -506,6 +588,7 @@ def _build_rdm_bank(
     n_workers: int = 1,
     verbose: bool = True,
     spin_preserving: bool = True,
+    project_doublons: bool = False,
 ) -> dict[int, np.ndarray]:
     """
     Precompute Γ^(n)[ψ_m] for ALL eigenstates m and ALL body orders n.
@@ -562,7 +645,8 @@ def _build_rdm_bank(
         # the parent's pages copy-on-write; since the workers only READ the
         # eigenvectors, the large data buffer is never copied — all workers share
         # a single physical copy. RAM stops growing with --workers.
-        _init_thermal_rdm_worker(eigvecs, n_so, n_electrons, spin_preserving)
+        _init_thermal_rdm_worker(eigvecs, n_so, n_electrons, spin_preserving,
+                                 project_doublons)
         try:
             ctx = mp.get_context("fork")
         except ValueError:                      # non-fork platform (not Linux)
@@ -587,6 +671,7 @@ def _build_rdm_bank(
             _, _, rdms, elapsed = _compute_cluster_rdm_bank(
                 n, sites, eigvecs, n_so, n_electrons,
                 spin_preserving=spin_preserving,
+                project_doublons=project_doublons,
             )
             cluster_results[n].append((sites, rdms))
             if verbose:
@@ -632,6 +717,7 @@ def build_or_load_rdm_bank(
     save_pkl: bool = True,
     verbose: bool = True,
     n_max: Optional[int] = None,
+    project_doublons: bool = False,
 ) -> dict:
     """
     Build — or load from the generic cache — the RDM bank for one Hamiltonian.
@@ -658,11 +744,13 @@ def build_or_load_rdm_bank(
         average_site_clusters=average_site_clusters,
         cache_version=cache_version, spin_preserving=spin_preserving,
         n_max=n_max,
+        project_doublons=project_doublons,
     )
 
     if use_pkl_cache and not force_recompute:
         payload = _load_thermal_rdm_bank_pkl(cache_path)
-        if payload is not None:
+        if (payload is not None
+                and bool(payload.get("project_doublons", False)) == bool(project_doublons)):
             if verbose:
                 print(f"    [cache] RDM bank → {cache_path}", flush=True)
             return {
@@ -683,6 +771,7 @@ def build_or_load_rdm_bank(
         n_values, eigvecs, n_so, n_electrons,
         L=L, average_site_clusters=average_site_clusters,
         n_workers=n_workers, verbose=verbose, spin_preserving=spin_preserving,
+        project_doublons=project_doublons,
     )
 
     if use_pkl_cache and save_pkl:
@@ -699,6 +788,7 @@ def build_or_load_rdm_bank(
             "average_site_clusters": bool(average_site_clusters),
             "spin_preserving": bool(spin_preserving),
             "sector": _sector_label(spin_preserving),
+            "project_doublons": bool(project_doublons),
             "energies": energies, "bank": bank,
             "environment": _basic_env_meta(),
         }
@@ -1338,7 +1428,8 @@ def run_thermal_gme_analysis(
     n_workers: int = 1,
     average_site_clusters: bool = True,
     spin_preserving: bool = True,\
-        T_view_max: Optional[float] = None
+        T_view_max: Optional[float] = None,
+    project_doublons: bool = False,
 ) -> dict:
     """
     Compute C_GME(n, T) for n = n_min..L as a function of temperature T.
@@ -1405,6 +1496,10 @@ def run_thermal_gme_analysis(
     average_site_clusters:
                    if True, average over all contiguous clusters for n < L;
                    for L=6 this gives 6 cluster jobs per n
+    project_doublons:
+                   remove the configurations with a doublon on the cluster sites
+                   from each eigenstate, without renormalising (_proj1 PKLs);
+                   result["omega"] is the trace of the thermal nBRDM
 
     Returns
     -------
@@ -1433,6 +1528,7 @@ def run_thermal_gme_analysis(
         average_site_clusters=average_site_clusters,
         adaptive_cutoff=adaptive_cutoff, cutoff_increment=cutoff_increment,
         spin_preserving=spin_preserving,
+        project_doublons=project_doublons,
     )
 
     if use_pkl_cache and not force_recompute and cache_path.exists():
@@ -1446,7 +1542,7 @@ def run_thermal_gme_analysis(
         ts_cache = _run_timestamp()
         prefix = f"{output_prefix}_" if output_prefix else ""
         plot_path = os.path.join(
-            output_dir, f"{prefix}task1_thermal_GME_L{L}_t{t}_U{U}_{_sector_tag(spin_preserving)}_{_grid_tag(np.asarray(result['T_values']), 'T')}_{ts_cache}.pdf"
+            output_dir, f"{prefix}task1_thermal_GME_L{L}_t{t}_U{U}_{_sector_tag(spin_preserving)}{_proj_tag(project_doublons)}_{_grid_tag(np.asarray(result['T_values']), 'T')}_{ts_cache}.pdf"
         )
         fig = _make_figure_T(
             np.asarray(result["T_values"]),
@@ -1485,6 +1581,7 @@ def run_thermal_gme_analysis(
         else str(cutoff_msg)
     )
     print(f"  thermal energy cutoff: {adaptive_msg}")
+    print(f"  doublons on the cluster sites removed: {bool(project_doublons)}")
     print(f"  n = {n_min}..{n_max}   T range [{T_values[0]:.4g}, {T_values[-1]:.4g}]"
           f"  ({len(T_values)} points)")
     print(f"{'-'*64}")
@@ -1500,6 +1597,7 @@ def run_thermal_gme_analysis(
         n_workers=n_workers, spin_preserving=spin_preserving,
         use_pkl_cache=use_pkl_cache, cache_version=cache_version,
         force_recompute=force_recompute, save_pkl=save_pkl, verbose=verbose,
+        project_doublons=project_doublons,
     )
     energies = bank_info["energies"]
     bank = bank_info["bank"]
@@ -1526,6 +1624,7 @@ def run_thermal_gme_analysis(
     print(f"\n[3] Temperature sweep ({len(T_values)} points) …", flush=True)
     C_GME: dict[int, np.ndarray] = {n: np.zeros(len(T_values)) for n in n_values}
     purity_dict: dict[int, np.ndarray] = {n: np.zeros(len(T_values)) for n in n_values}
+    omega_dict: dict[int, np.ndarray] = {n: np.zeros(len(T_values)) for n in n_values}
     active_counts = np.zeros(len(T_values), dtype=int)
     converged_cutoffs = np.zeros(len(T_values))
     gme_tasks = []
@@ -1554,6 +1653,7 @@ def run_thermal_gme_analysis(
 
         for n in n_values:
             Gamma_T = np.einsum("m,mij->ij", probs_active, bank[n][active])
+            omega_dict[n][i] = float(np.real(np.trace(Gamma_T)))
             Gamma_T = normalize_density_matrix(Gamma_T)
             gamma_hash = _array_sha256(Gamma_T)
             job_path = _thermal_gme_job_cache_path(
@@ -1696,7 +1796,7 @@ def run_thermal_gme_analysis(
     ts = _run_timestamp()
     prefix = f"{output_prefix}_" if output_prefix else ""
     plot_path = os.path.join(
-        output_dir, f"{prefix}task1_thermal_GME_L{L}_t{t}_U{U}_{_sector_tag(spin_preserving)}_{_grid_tag(T_values, 'T')}_{ts}.pdf"
+        output_dir, f"{prefix}task1_thermal_GME_L{L}_t{t}_U{U}_{_sector_tag(spin_preserving)}{_proj_tag(project_doublons)}_{_grid_tag(T_values, 'T')}_{ts}.pdf"
     )
     sinfo = dict(L=L, t=t, U=U, mode=mode, Ne=n_electrons,
                  gap=gap, C_exact_gs=C_exact_gs)
@@ -1710,6 +1810,8 @@ def run_thermal_gme_analysis(
         "T_values":              T_values,
         "C_GME":                 C_GME,
         "purity":                purity_dict,
+        "omega":                 omega_dict,
+        "project_doublons":      bool(project_doublons),
         "C_exact_gs":            C_exact_gs,
         "energies":              energies,
         "gap":                   gap,
@@ -1736,6 +1838,7 @@ def run_thermal_gme_analysis(
         result["cache_path"] = str(cache_path)
         metadata = {
             "analysis_type": "thermal",
+            "project_doublons": bool(project_doublons),
             "cache_version": cache_version,
             "L": int(L),
             "t": float(t),
@@ -3351,6 +3454,7 @@ def _uscan_cache_path(
     spin_preserving: bool = True,
     excited_singlet: bool = False,
     V: float = 0.0,
+    project_doublons: bool = False,
 ) -> Path:
     """Deterministic PKL path for one U-scan run."""
     U_arr = np.asarray(U_values, dtype=float)
@@ -3361,7 +3465,7 @@ def _uscan_cache_path(
         f"{_sector_tag(spin_preserving)}"
         # tags added ONLY when set, so existing ground-state / V=0 PKLs keep
         # their names and stay cache-reusable
-        f"{'_es' if excited_singlet else ''}"
+        f"{'_es' if excited_singlet else ''}{_proj_tag(project_doublons)}"
         f"{('_V' + _safe_float_tag(float(V))) if abs(V) > 1e-12 else ''}_"
         f"restarts{int(n_restarts)}_iter{int(max_iter)}_"
         f"kmax{int(k_max_extra)}_tol{_safe_float_tag(float(tol))}_"
@@ -3387,6 +3491,7 @@ def _vscan_cache_path(
     cache_version: str,
     spin_preserving: bool = True,
     excited_singlet: bool = False,
+    project_doublons: bool = False,
 ) -> Path:
     """Deterministic PKL path for one V-scan run (fixed U and t; V swept)."""
     V_arr = np.asarray(V_values, dtype=float)
@@ -3395,7 +3500,7 @@ def _vscan_cache_path(
         f"L{L}_Ne{n_electrons}_U{_safe_float_tag(U)}_t{_safe_float_tag(t)}_"
         f"mode-{mode}_nmin{n_min}_solver-{solver}_"
         f"{_sector_tag(spin_preserving)}"
-        f"{'_es' if excited_singlet else ''}_"
+        f"{'_es' if excited_singlet else ''}{_proj_tag(project_doublons)}_"
         f"restarts{int(n_restarts)}_iter{int(max_iter)}_"
         f"kmax{int(k_max_extra)}_tol{_safe_float_tag(float(tol))}_"
         f"{_grid_tag(V_arr, 'V')}-{_array_digest(V_arr)}.pkl"
@@ -3461,6 +3566,7 @@ def run_U_dependence_gme(
     spin_preserving: bool = True,
     excited_singlet: bool = False,
     singlet_k: int = 12,
+    project_doublons: bool = False,
 ) -> dict:
     """
     Compute C_GME(n) at T=0 for each value of U (fixing t).
@@ -3504,6 +3610,7 @@ def run_U_dependence_gme(
         spin_preserving=spin_preserving,
         excited_singlet=excited_singlet,
         V=V,
+        project_doublons=project_doublons,
     )
 
     if use_pkl_cache and not force_recompute and cache_path.exists():
@@ -3515,7 +3622,7 @@ def run_U_dependence_gme(
         prefix = f"{output_prefix}_" if output_prefix else ""
         plot_path = os.path.join(
             output_dir,
-            f"{prefix}task4_uscan_GME_L{L}_t{t}_{_sector_tag(spin_preserving)}_{_grid_tag(np.asarray(result['U_values']), 'U')}_{ts}.pdf"
+            f"{prefix}task4_uscan_GME_L{L}_t{t}_{_sector_tag(spin_preserving)}{_proj_tag(project_doublons)}_{_grid_tag(np.asarray(result['U_values']), 'U')}_{ts}.pdf"
         )
         plot_scan_finalized(result, plot_path, spin_preserving=spin_preserving)
         result["plot_path"] = plot_path
@@ -3533,6 +3640,7 @@ def run_U_dependence_gme(
 
     C_GME: dict[int, np.ndarray] = {n: np.zeros(len(U_values)) for n in n_values}
     purity_dict: dict[int, np.ndarray] = {n: np.zeros(len(U_values)) for n in n_values}
+    omega_dict: dict[int, np.ndarray] = {n: np.zeros(len(U_values)) for n in n_values}
     entropy_dict: dict[int, np.ndarray] = {n: np.zeros(len(U_values)) for n in n_values}
     rank_dict: dict[int, np.ndarray] = {n: np.zeros(len(U_values), dtype=int) for n in n_values}
     convergence: dict[int, list] = {n: [None] * len(U_values) for n in n_values}
@@ -3581,7 +3689,8 @@ def run_U_dependence_gme(
         for n in n_values:
             sites = tuple(range(n))
             ops = _precompute_ops(sites, n_so, n_electrons,
-                                  spin_preserving=spin_preserving)
+                                  spin_preserving=spin_preserving,
+                                  project_doublons=project_doublons)
 
             if len(degen) <= 1:
                 # <=1: non-degenerate state — use psi0 directly. This also
@@ -3599,6 +3708,7 @@ def run_U_dependence_gme(
 
             tr = np.real(np.trace(rho_raw))
             rho = rho_raw / tr if abs(tr) > 1e-14 else rho_raw
+            omega_dict[n][i] = tr
 
             c_val, pur, _detail = compute_gme(
                 rho, n,
@@ -3630,7 +3740,7 @@ def run_U_dependence_gme(
     os.makedirs(output_dir, exist_ok=True)
     prefix = f"{output_prefix}_" if output_prefix else ""
     plot_path = os.path.join(
-        output_dir, f"{prefix}task4_uscan_GME_L{L}_t{t}_{_sector_tag(spin_preserving)}_{_grid_tag(U_values, 'U')}_{ts}.pdf"
+        output_dir, f"{prefix}task4_uscan_GME_L{L}_t{t}_{_sector_tag(spin_preserving)}{_proj_tag(project_doublons)}_{_grid_tag(U_values, 'U')}_{ts}.pdf"
     )
 
     result = {
@@ -3641,6 +3751,8 @@ def run_U_dependence_gme(
         "C_wootters_n2": C_wootters_n2,
         "C_analytical_n2": C_analytical_n2,
         "purity":        purity_dict,
+        "omega":         omega_dict,
+        "project_doublons": bool(project_doublons),
         "entropy":       entropy_dict,
         "rank":          rank_dict,
         "convergence":   convergence,   # {n: [solver detail per U]} — standard compute_gme format
@@ -3664,6 +3776,7 @@ def run_U_dependence_gme(
     if save_pkl or use_pkl_cache:
         metadata = {
             "analysis_type": "U_dependence",
+            "project_doublons": bool(project_doublons),
             "cache_version": cache_version,
             "L": int(L), "t": float(t), "V": float(V),
             "mode": str(mode), "Ne": int(n_electrons),
@@ -3710,6 +3823,7 @@ def run_V_dependence_gme(
     spin_preserving: bool = True,
     excited_singlet: bool = False,
     singlet_k: int = 12,
+    project_doublons: bool = False,
 ) -> dict:
     """
     Compute C_GME(n) at T=0 for each value of the nearest-neighbour interaction
@@ -3745,6 +3859,7 @@ def run_V_dependence_gme(
         max_iter=max_iter, tol=tol, k_max_extra=k_max_extra,
         V_values=V_values, cache_version=cache_version,
         spin_preserving=spin_preserving, excited_singlet=excited_singlet,
+        project_doublons=project_doublons,
     )
 
     if use_pkl_cache and not force_recompute and cache_path.exists():
@@ -3756,7 +3871,7 @@ def run_V_dependence_gme(
         prefix = f"{output_prefix}_" if output_prefix else ""
         plot_path = os.path.join(
             output_dir,
-            f"{prefix}task4_vscan_GME_L{L}_U{U}_t{t}_{_sector_tag(spin_preserving)}_{_grid_tag(np.asarray(result['V_values']), 'V')}_{ts}.pdf"
+            f"{prefix}task4_vscan_GME_L{L}_U{U}_t{t}_{_sector_tag(spin_preserving)}{_proj_tag(project_doublons)}_{_grid_tag(np.asarray(result['V_values']), 'V')}_{ts}.pdf"
         )
         plot_scan_finalized(result, plot_path, spin_preserving=spin_preserving)
         result["plot_path"] = plot_path
@@ -3774,6 +3889,7 @@ def run_V_dependence_gme(
 
     C_GME: dict[int, np.ndarray] = {n: np.zeros(len(V_values)) for n in n_values}
     purity_dict: dict[int, np.ndarray] = {n: np.zeros(len(V_values)) for n in n_values}
+    omega_dict: dict[int, np.ndarray] = {n: np.zeros(len(V_values)) for n in n_values}
     entropy_dict: dict[int, np.ndarray] = {n: np.zeros(len(V_values)) for n in n_values}
     rank_dict: dict[int, np.ndarray] = {n: np.zeros(len(V_values), dtype=int) for n in n_values}
     convergence: dict[int, list] = {n: [None] * len(V_values) for n in n_values}
@@ -3819,7 +3935,8 @@ def run_V_dependence_gme(
         for n in n_values:
             sites = tuple(range(n))
             ops = _precompute_ops(sites, n_so, n_electrons,
-                                  spin_preserving=spin_preserving)
+                                  spin_preserving=spin_preserving,
+                                  project_doublons=project_doublons)
 
             if len(degen) <= 1:
                 # <=1: non-degenerate state — use psi0 directly. This also
@@ -3837,6 +3954,7 @@ def run_V_dependence_gme(
 
             tr = np.real(np.trace(rho_raw))
             rho = rho_raw / tr if abs(tr) > 1e-14 else rho_raw
+            omega_dict[n][i] = tr
 
             c_val, pur, _detail = compute_gme(
                 rho, n,
@@ -3867,7 +3985,7 @@ def run_V_dependence_gme(
     os.makedirs(output_dir, exist_ok=True)
     prefix = f"{output_prefix}_" if output_prefix else ""
     plot_path = os.path.join(
-        output_dir, f"{prefix}task4_vscan_GME_L{L}_U{U}_t{t}_{_sector_tag(spin_preserving)}_{_grid_tag(V_values, 'V')}_{ts}.pdf"
+        output_dir, f"{prefix}task4_vscan_GME_L{L}_U{U}_t{t}_{_sector_tag(spin_preserving)}{_proj_tag(project_doublons)}_{_grid_tag(V_values, 'V')}_{ts}.pdf"
     )
 
     result = {
@@ -3878,6 +3996,8 @@ def run_V_dependence_gme(
         "C_wootters_n2": C_wootters_n2,
         "C_analytical_n2": C_analytical_n2,
         "purity":        purity_dict,
+        "omega":         omega_dict,
+        "project_doublons": bool(project_doublons),
         "entropy":       entropy_dict,
         "rank":          rank_dict,
         "convergence":   convergence,
@@ -3898,6 +4018,7 @@ def run_V_dependence_gme(
     if save_pkl or use_pkl_cache:
         metadata = {
             "analysis_type": "V_dependence",
+            "project_doublons": bool(project_doublons),
             "cache_version": cache_version,
             "L": int(L), "t": float(t), "U": float(U),
             "mode": str(mode), "Ne": int(n_electrons),
@@ -3942,6 +4063,7 @@ def _nscan_cache_path(
     cache_version: str,
     spin_preserving: bool = True,
     excited_singlet: bool = False,
+    project_doublons: bool = False,
 ) -> Path:
     """Deterministic PKL path for one N-scan (fixed L, U, t, V; Ne swept)."""
     N_arr = np.asarray(N_values, dtype=float)
@@ -3950,7 +4072,7 @@ def _nscan_cache_path(
         f"L{L}_U{_safe_float_tag(U)}_t{_safe_float_tag(t)}_"
         f"mode-{mode}_nmin{n_min}_solver-{solver}_"
         f"{_sector_tag(spin_preserving)}"
-        f"{'_es' if excited_singlet else ''}"
+        f"{'_es' if excited_singlet else ''}{_proj_tag(project_doublons)}"
         f"{('_V' + _safe_float_tag(float(V))) if abs(V) > 1e-12 else ''}_"
         f"restarts{int(n_restarts)}_iter{int(max_iter)}_"
         f"kmax{int(k_max_extra)}_tol{_safe_float_tag(float(tol))}_"
@@ -3983,6 +4105,7 @@ def run_Ne_dependence_gme(
     spin_preserving: bool = False,
     excited_singlet: bool = False,
     singlet_k: int = 16,
+    project_doublons: bool = False,
 ) -> dict:
     """
     C_GME(n) at T=0 as a function of the electron number Ne (the N-scan),
@@ -4009,6 +4132,7 @@ def run_Ne_dependence_gme(
         max_iter=max_iter, tol=tol, k_max_extra=k_max_extra,
         N_values=N_values, cache_version=cache_version,
         spin_preserving=spin_preserving, excited_singlet=excited_singlet,
+        project_doublons=project_doublons,
     )
 
     _state = "1st excited singlet" if excited_singlet else "ground state"
@@ -4019,7 +4143,7 @@ def run_Ne_dependence_gme(
         return os.path.join(
             output_dir,
             f"{prefix}task_nscan_GME_L{L}_U{U}_t{t}{_vtag}_"
-            f"{'es_' if excited_singlet else ''}{_sector_tag(spin_preserving)}_"
+            f"{'es_' if excited_singlet else ''}{_sector_tag(spin_preserving)}{_proj_tag(project_doublons)}_"
             f"N{min(N_values)}to{max(N_values)}_{ts}.pdf"
         )
 
@@ -4046,6 +4170,7 @@ def run_Ne_dependence_gme(
 
     C_GME: dict[int, np.ndarray] = {n: np.full(Nn, np.nan) for n in n_values}
     purity_dict: dict[int, np.ndarray] = {n: np.full(Nn, np.nan) for n in n_values}
+    omega_dict: dict[int, np.ndarray] = {n: np.full(Nn, np.nan) for n in n_values}
     entropy_dict: dict[int, np.ndarray] = {n: np.full(Nn, np.nan) for n in n_values}
     rank_dict: dict[int, np.ndarray] = {n: np.full(Nn, -1, dtype=int) for n in n_values}
     convergence: dict[int, list] = {n: [None] * Nn for n in n_values}
@@ -4097,7 +4222,8 @@ def run_Ne_dependence_gme(
                 continue
             sites = tuple(range(n))
             ops = _precompute_ops(sites, n_so, Ne,
-                                  spin_preserving=spin_preserving)
+                                  spin_preserving=spin_preserving,
+                                  project_doublons=project_doublons)
 
             if len(degen) <= 1:
                 rho_raw = _rdm_from_ops(ops, psi0, n)
@@ -4110,6 +4236,7 @@ def run_Ne_dependence_gme(
 
             tr = np.real(np.trace(rho_raw))
             rho = rho_raw / tr if abs(tr) > 1e-14 else rho_raw
+            omega_dict[n][i] = tr
 
             c_val, pur, _detail = compute_gme(
                 rho, n,
@@ -4147,6 +4274,8 @@ def run_Ne_dependence_gme(
         "C_wootters_n2": C_wootters_n2,
         "C_analytical_n2": C_analytical_n2,
         "purity":        purity_dict,
+        "omega":         omega_dict,
+        "project_doublons": bool(project_doublons),
         "entropy":       entropy_dict,
         "rank":          rank_dict,
         "convergence":   convergence,
@@ -4167,6 +4296,7 @@ def run_Ne_dependence_gme(
     if save_pkl or use_pkl_cache:
         metadata = {
             "analysis_type": "N_dependence",
+            "project_doublons": bool(project_doublons),
             "cache_version": cache_version,
             "L": int(L), "t": float(t), "U": float(U), "V": float(V),
             "mode": str(mode),
