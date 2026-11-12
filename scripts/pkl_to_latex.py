@@ -321,7 +321,7 @@ def _axis_block(body: str, *, xlabel: str, ylabel: str, title: str = "",
         # must be the same serif face as the body.
         "tick label style={font=\\footnotesize\\rmfamily, "
         "/pgf/number format/fixed}",
-        "label style={font=\\small\\rmfamily}",
+        "label style={font=\\normalsize\\rmfamily}",
         "scaled ticks=false",
         # legend sits ABOVE the axis: placed inside, it covers the curves that
         # approach C_GME = 1 (the whole-ring and exact references)
@@ -455,7 +455,7 @@ def _finish_axis(body: str, curves, *, xlabel: str, ylabel: str,
         # after end axis: drawn outside the clip region, so the letter is
         # not cut off when it sits left of the axis box
         extra.append("after end axis/.append code={\\node[anchor=east, "
-                     "font=\\small\\rmfamily] at (axis description cs:"
+                     "font=\\normalsize\\rmfamily] at (axis description cs:"
                      f"{lx:g},{ly:.3f}) {{{PANEL_LETTER}}};}}")
     return _axis_block(body, xlabel=xlabel, ylabel=ylabel, xmin=xmin,
                        xmax=xmax, ymin=ymin, ymax=ymax, legend_cols=cols,
@@ -490,7 +490,7 @@ def _plot_line(x, y, idx: int, legend: str, *, style: str = "") -> str:
     # matplotlib defaults: those apply to a 9x6in canvas, and reusing them here
     # gives markers that swamp the data.  mark size is a RADIUS in PGFPlots.
     sty = style or (f"color=gmeC{i}, mark={m}, mark size=1.1pt{mark_opts}, "
-                    f"line width=0.7pt")
+                    f"line width=1.2pt")
     # A curve reduced to ONE surviving point (the purity-gated exact line on an
     # Ne-scan is the usual case) draws nothing at all when the style says
     # mark=none: there is no segment to stroke. Give it a visible marker.
@@ -751,7 +751,7 @@ def build_tTsurface(result: dict, meta: dict, stem: str) -> str:
             "    colorbar style={font=\\scriptsize\\rmfamily, "
             "ylabel={" + YLABEL + "}},\n"
             "    tick label style={font=\\footnotesize\\rmfamily},\n"
-            "    label style={font=\\small\\rmfamily},\n"
+            "    label style={font=\\normalsize\\rmfamily},\n"
             "    point meta min=0, point meta max=1,\n"
             "  ]\n"
             "    \\addplot3[surf, shader=interp, mesh/ordering=x varies,\n"
@@ -891,7 +891,7 @@ _PREAMBLE = r"""\documentclass[aps,prb,reprint]{revtex4-2}
 \pgfplotsset{
   every axis/.append style={font=\rmfamily},
   tick label style={font=\footnotesize\rmfamily},
-  label style={font=\small\rmfamily},
+  label style={font=\normalsize\rmfamily},
   legend style={font=\scriptsize\rmfamily},
 }
 """

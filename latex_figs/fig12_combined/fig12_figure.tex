@@ -1,0 +1,28 @@
+% Fig. 1 and Fig. 2 of the paper merged into one figure, panels (a)-(d).
+% Paste into the manuscript (revtex4-2, reprint). Needs in the preamble:
+%   \usepackage{pgfplots} \pgfplotsset{compat=1.18}
+% and the four panel_*.tex files next to the manuscript (or adjust the \input paths).
+% The panels are drawn \columnwidth wide; inside this figure that width is set to a fraction of
+% \textwidth so that two panels and their (a)-(d) labels fit the page. Font sizes do not change.
+\begin{figure*}
+  \centering
+  \setlength{\columnwidth}{0.42\textwidth}%
+  \pgfplotsset{every axis/.append style={ytick={0,0.2,0.4,0.6,0.8,1}}}%
+  \begin{tabular}{@{}c@{\hspace{6mm}}c@{}}
+    \input{panel_a_gs_L6.tex} & \input{panel_b_es_L6.tex} \\[2pt]
+    \input{panel_c_gs_L8.tex} & \input{panel_d_es_L8.tex}
+  \end{tabular}
+  \caption{Genuine multipartite entanglement concurrence of the spin state extracted from the Hubbard ring at
+    half filling ($K=L$), with $V=0$, for different values of the spin number $n$: ground state for (a) $L=6$ and
+    (c) $L=8$ sites; first excited singlet for (b) $L=6$ and (d) $L=8$ sites. The same color code for the spin
+    number $n$, given in panel (d), is adopted in all panels.}
+  \label{fig01}
+\end{figure*}
+
+% Alternative: the compiled figure as one PDF (fig12_combined.pdf, made by fig12_combined.tex)
+% \begin{figure*}
+%   \centering
+%   \includegraphics[width=\textwidth]{fig12_combined.pdf}
+%   \caption{...}
+%   \label{fig01}
+% \end{figure*}
